@@ -139,10 +139,26 @@ pub async fn submit_dock_target(
     scale: f64,
     source: DockSource,
 ) -> Result<u64, String> {
+    publish_dock_target(state, Some((attached, scale)), source).await
+}
+/// Replay samples the authoritative monitor state under the publication lock.
+pub(crate) async fn submit_current_dock_target(
+    state: &Arc<RwLock<RuntimeState>>,
+    source: DockSource,
+) -> Result<u64, String> {
+    publish_dock_target(state, None, source).await
+}
+async fn publish_dock_target(
+    state: &Arc<RwLock<RuntimeState>>,
+    observed: Option<(bool, f64)>,
+    source: DockSource,
+) -> Result<u64, String> {
+    let mut g = state.write().await;
+    let (attached, scale) =
+        observed.unwrap_or((g.status.keyboard_attached, g.settings.default_scale));
     if !scale.is_finite() || scale <= 0. {
         return Err("Invalid display scale".into());
     }
-    let mut g = state.write().await;
     if let Some(reason) = &g.storage_fault {
         return Err(reason.clone());
     }
@@ -160,9 +176,19 @@ pub async fn submit_dock_target(
         source,
     });
     save(&mut g)?;
+    start_dock_worker(state, &mut g);
+    Ok(generation)
+}
+fn start_dock_worker(state: &Arc<RwLock<RuntimeState>>, g: &mut RuntimeState) {
     if !g.display_safety.worker_running
+        && g.display_safety.target.is_some()
+        && g.display_safety.pending.is_none()
+        && g.display_safety.receipt_to_consume.is_none()
+        && !g.display_safety.manual_pending
         && g.display_safety.degraded.is_none()
         && !g.display_safety.suspended
+        && g.storage_fault.is_none()
+        && g.session_agent.connected
     {
         g.display_safety.worker_running = true;
         let state = state.clone();
@@ -172,7 +198,11 @@ pub async fn submit_dock_target(
             }
         });
     }
-    Ok(generation)
+}
+/// One bounded wakeup per daemon cleanup tick, only for unsent healthy intent.
+pub(crate) async fn resume_dock_target(state: &Arc<RwLock<RuntimeState>>) {
+    let mut g = state.write().await;
+    start_dock_worker(state, &mut g);
 }
 pub async fn drain_dock_targets(state: Arc<RwLock<RuntimeState>>) -> Result<(), String> {
     let executor = state.read().await.display_executor.clone();
@@ -370,8 +400,11 @@ async fn finish_receipt(
             }
             g.display_safety.last_seen_revision = Some(report.revision_after);
         } else if decision == CommitDecision::NotStarted {
-            if g.display_safety.target.as_ref().map(|t| t.generation)
-                == Some(receipt.operation.target_generation)
+            let transient = matches!(&report.status,
+                MutationStatus::NotStarted { reason } if reason == "Busy" || reason == "RevisionChanged");
+            if !transient
+                && g.display_safety.target.as_ref().map(|t| t.generation)
+                    == Some(receipt.operation.target_generation)
             {
                 g.display_safety.target = None;
             }
@@ -424,8 +457,18 @@ async fn finish_receipt(
     }
 }
 async fn consume_saved_receipt(state: &Arc<RwLock<RuntimeState>>) -> Result<(), String> {
-    let Some(receipt) = state.read().await.display_safety.receipt_to_consume.clone() else {
-        return Ok(());
+    let receipt = {
+        let mut g = state.write().await;
+        if let Some(reason) = &g.storage_fault {
+            return Err(reason.clone());
+        }
+        let Some(receipt) = g.display_safety.receipt_to_consume.clone() else {
+            return Ok(());
+        };
+        // Never confuse an in-memory staged obligation with durable evidence.
+        // Re-establish durability before every consume, including cleanup retries.
+        save(&mut g)?;
+        receipt
     };
     if state.read().await.display_safety.degraded.is_some() {
         push_degraded_policy(state).await?;
@@ -497,10 +540,39 @@ pub(crate) async fn apply_manual(
     state: &Arc<RwLock<RuntimeState>>,
     mutation: crate::ipc::protocol::ManualDisplayMutation,
 ) -> Result<MutationReport, String> {
+    apply_non_dock(state, mutation, None).await
+}
+pub(crate) async fn apply_sensor(
+    state: &Arc<RwLock<RuntimeState>>,
+    scope: DisplayScope,
+    orientation: crate::models::Orientation,
+) -> Result<MutationReport, String> {
+    let scale = state.read().await.settings.default_scale;
+    apply_non_dock(
+        state,
+        crate::ipc::protocol::ManualDisplayMutation::Orientation { orientation, scale },
+        Some(scope),
+    )
+    .await
+}
+async fn apply_non_dock(
+    state: &Arc<RwLock<RuntimeState>>,
+    mutation: crate::ipc::protocol::ManualDisplayMutation,
+    sensor_scope: Option<DisplayScope>,
+) -> Result<MutationReport, String> {
+    let sensor = sensor_scope.is_some();
     let executor = state.read().await.display_executor.clone();
     let _execution = executor.lock().await;
     {
         let g = state.read().await;
+        if let Some(expected) = &sensor_scope {
+            if !g.settings.auto_rotate
+                || g.display_safety.degraded.is_some()
+                || scope_of(&g)? != *expected
+            {
+                return Err("Automatic rotation is disabled or its session changed".into());
+            }
+        }
         if g.display_safety.suspended
             || g.display_safety.pending.is_some()
             || g.display_safety.manual_pending
@@ -520,8 +592,11 @@ pub(crate) async fn apply_manual(
     }
     {
         let mut g = state.write().await;
-        if scope_of(&g)? != scope {
-            return Err("Display session changed".into());
+        if scope_of(&g)? != scope
+            || sensor_scope.as_ref().is_some_and(|s| s != &scope)
+            || (sensor && (!g.settings.auto_rotate || g.display_safety.degraded.is_some()))
+        {
+            return Err("Display session or automatic policy changed".into());
         }
         g.display_safety.manual_pending = true;
         save(&mut g)?;
@@ -529,6 +604,7 @@ pub(crate) async fn apply_manual(
     let response = rpc(
         state,
         SessionCommand::ApplyDisplayMutation {
+            sensor,
             scope: scope.clone(),
             mutation: mutation.clone(),
         },
@@ -547,6 +623,13 @@ pub(crate) async fn apply_manual(
             {
                 g.display_safety.manual_pending = false;
                 if matches!(report.status, MutationStatus::Verified) {
+                    if let crate::ipc::protocol::ManualDisplayMutation::Orientation {
+                        orientation,
+                        ..
+                    } = &mutation
+                    {
+                        g.status.orientation = orientation.clone();
+                    }
                     let keep_ownership = matches!(
                         mutation,
                         crate::ipc::protocol::ManualDisplayMutation::Orientation { .. }
@@ -565,12 +648,12 @@ pub(crate) async fn apply_manual(
                 };
             }
             drop(g);
-            degrade(state, "Manual display result could not be verified").await;
-            Err("Manual display operation is degraded".into())
+            degrade(state, "Display result could not be verified").await;
+            Err("Display operation is degraded".into())
         }
         _ => {
-            degrade(state, "Manual display response is pending or unknown").await;
-            Err("Manual display result is unknown; automatic changes paused".into())
+            degrade(state, "Display response is pending or unknown").await;
+            Err("Display result is unknown; automatic changes paused".into())
         }
     }
 }
@@ -667,10 +750,18 @@ mod tests {
                             scope,
                             automatic_blocked,
                             manual_allowed,
-                        } => match g.bind_context(scope, automatic_blocked, manual_allowed) {
-                            Ok(()) => SessionResponse::Ack,
-                            Err(message) => SessionResponse::Error { message },
-                        },
+                        } => {
+                            if r.join("hold-bind").exists() {
+                                std::fs::write(r.join("bind-entered"), "").unwrap();
+                                while r.join("hold-bind").exists() {
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                }
+                            }
+                            match g.bind_context(scope, automatic_blocked, manual_allowed) {
+                                Ok(()) => SessionResponse::Ack,
+                                Err(message) => SessionResponse::Error { message },
+                            }
+                        }
                         SessionCommand::ShowNotification { .. } => SessionResponse::Ack,
                         SessionCommand::GetDisplayExecutionState => {
                             SessionResponse::DisplayExecutionState {
@@ -686,6 +777,18 @@ mod tests {
                         },
                         SessionCommand::ApplyDockOperation { operation } => {
                             c.fetch_add(1, Ordering::SeqCst);
+                            if r.join("race-revision").exists() {
+                                std::fs::remove_file(r.join("race-revision")).unwrap();
+                                g.start_write(
+                                    DisplayMutationKind::SensorRotation,
+                                    operation.scope.clone(),
+                                    None,
+                                    || async { super::super::display_safety::tests::report() },
+                                )
+                                .unwrap()
+                                .await
+                                .unwrap();
+                            }
                             let op = operation.clone();
                             let before =
                                 crate::hardware::sysfs::observe_secondary_panel(&r.join("drm"));
@@ -731,8 +834,14 @@ mod tests {
                                 },
                             }
                         }
-                        SessionCommand::ApplyDisplayMutation { scope, mutation } => {
-                            let kind = if matches!(mutation, ManualDisplayMutation::Layout { .. }) {
+                        SessionCommand::ApplyDisplayMutation {
+                            scope,
+                            mutation,
+                            sensor,
+                        } => {
+                            let kind = if sensor {
+                                DisplayMutationKind::SensorRotation
+                            } else if matches!(mutation, ManualDisplayMutation::Layout { .. }) {
                                 DisplayMutationKind::ManualLayout
                             } else {
                                 DisplayMutationKind::ManualOrientation
@@ -740,6 +849,20 @@ mod tests {
                             let before =
                                 crate::hardware::sysfs::observe_secondary_panel(&r.join("drm"));
                             match g.start_write(kind, scope, None, move || async move {
+                                if sensor {
+                                    std::fs::write(r.join("sensor-entered"), "").unwrap();
+                                    while r.join("hold-sensor").exists() {
+                                        tokio::time::sleep(Duration::from_millis(5)).await;
+                                    }
+                                    if r.join("unknown-sensor").exists() {
+                                        let mut report =
+                                            super::super::display_safety::tests::report();
+                                        report.status = MutationStatus::Unknown {
+                                            reason: "injected sensor uncertainty".into(),
+                                        };
+                                        return report;
+                                    }
+                                }
                                 let enabled = match mutation {
                                     ManualDisplayMutation::Layout { layout } => layout
                                         .displays
@@ -966,8 +1089,228 @@ mod tests {
         assert!(reconcile_pending_dock(&f.state, ReconcileMode::Active)
             .await
             .is_err());
+        assert!(reconcile_pending_dock(&f.state, ReconcileMode::LateCleanup)
+            .await
+            .is_err());
         assert!(f.gate.snapshot().receipt.is_some());
         assert!(f.state.read().await.display_safety.pending.is_some());
+    }
+    #[tokio::test]
+    async fn sensor_inflight_has_durable_obligation_before_backend_runs() {
+        let f = fixture("enabled", None).await;
+        f.state.write().await.settings.auto_rotate = true;
+        std::fs::write(f.root.join("hold-sensor"), "").unwrap();
+        let state = f.state.clone();
+        let task = tokio::spawn(async move {
+            apply_sensor(
+                &state,
+                super::super::display_safety::tests::scope(),
+                Orientation::Normal,
+            )
+            .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while !f.root.join("sensor-entered").exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let storage = f.state.read().await.storage.clone();
+        let mut loaded = RuntimeState::load_from(storage).unwrap();
+        assert!(
+            loaded.display_safety.manual_pending,
+            "sensor execution must have a durable pre-execution obligation"
+        );
+        // Model daemon death in flight: durable pending survives process replacement.
+        task.abort();
+        loaded
+            .display_safety
+            .begin_daemon("boot", "replacement-daemon".into());
+        assert!(loaded.display_safety.degraded.is_some());
+        assert!(!loaded.display_safety.manual_allowed);
+        assert!(loaded.display_safety.manual_pending);
+        std::fs::remove_file(f.root.join("hold-sensor")).unwrap();
+        // Owned Agent work still completes after its daemon waiter is gone.
+        timeout(Duration::from_secs(1), async {
+            while f.gate.snapshot().active.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn sensor_unknown_survives_agent_and_daemon_replacement() {
+        let f = fixture("enabled", None).await;
+        f.state.write().await.settings.auto_rotate = true;
+        std::fs::write(f.root.join("unknown-sensor"), "").unwrap();
+        assert!(apply_sensor(
+            &f.state,
+            super::super::display_safety::tests::scope(),
+            Orientation::Normal
+        )
+        .await
+        .is_err());
+        let mut loaded = RuntimeState::load_from(f.state.read().await.storage.clone()).unwrap();
+        loaded
+            .display_safety
+            .begin_daemon("boot", "replacement-daemon".into());
+        assert!(loaded.display_safety.manual_pending);
+        assert!(loaded.display_safety.degraded.is_some());
+        let socket = f
+            .state
+            .read()
+            .await
+            .session_agent
+            .socket_path
+            .clone()
+            .unwrap();
+        super::super::daemon::handle_session_registration(
+            &f.state,
+            "desktop".into(),
+            SessionBackend::Gnome,
+            socket,
+            "replacement-agent".into(),
+        )
+        .await
+        .unwrap();
+        let scope = f.state.read().await.session_agent.scope.clone().unwrap();
+        let replacement = Arc::new(AgentDisplayGate::new("replacement-agent".into()));
+        let safety = f.state.read().await.display_safety.clone();
+        replacement
+            .bind_context(
+                scope.clone(),
+                safety.degraded.is_some(),
+                safety.manual_allowed && !safety.manual_pending,
+            )
+            .unwrap();
+        assert!(replacement
+            .start_write(
+                DisplayMutationKind::SensorRotation,
+                scope.clone(),
+                None,
+                || async { panic!("replacement must not write") }
+            )
+            .is_err());
+        assert!(replacement
+            .start_write(
+                DisplayMutationKind::ManualOrientation,
+                scope,
+                None,
+                || async { panic!("replacement must not write") }
+            )
+            .is_err());
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn sensor_respects_degraded_automatic_policy_even_when_manual_is_allowed() {
+        let f = fixture("enabled", None).await;
+        {
+            let mut g = f.state.write().await;
+            g.settings.auto_rotate = true;
+            g.display_safety.degraded = Some("late verified Dock".into());
+            g.display_safety.manual_allowed = true;
+        }
+        assert!(apply_sensor(
+            &f.state,
+            super::super::display_safety::tests::scope(),
+            Orientation::Normal
+        )
+        .await
+        .is_err());
+        assert!(!f.root.join("sensor-entered").exists());
+    }
+    #[tokio::test]
+    async fn busy_sensor_keeps_latest_target_and_cleanup_resumes_it() {
+        let f = fixture("enabled", None).await;
+        let n = Arc::new(tokio::sync::Notify::new());
+        let release = n.clone();
+        let task = f
+            .gate
+            .start_write(
+                DisplayMutationKind::SensorRotation,
+                super::super::display_safety::tests::scope(),
+                None,
+                move || async move {
+                    release.notified().await;
+                    super::super::display_safety::tests::report()
+                },
+            )
+            .unwrap();
+        submit_dock_target(&f.state, true, 1.67, DockSource::Monitor)
+            .await
+            .unwrap();
+        idle(&f).await;
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+        n.notify_one();
+        task.await.unwrap();
+        // Exercise exactly the daemon's periodic cleanup entry point.
+        super::super::daemon::cleanup_display_work(&f.state).await;
+        idle(&f).await;
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        assert!(f.state.read().await.display_safety.target.is_none());
+    }
+    #[tokio::test]
+    async fn revision_changed_before_admission_reobserves_latest_target() {
+        let f = fixture("enabled", None).await;
+        std::fs::write(f.root.join("race-revision"), "").unwrap();
+        submit_dock_target(&f.state, true, 1.67, DockSource::Monitor)
+            .await
+            .unwrap();
+        idle(&f).await;
+        assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+        assert!(f.state.read().await.display_safety.pending.is_none());
+        assert!(f.state.read().await.display_safety.target.is_none());
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("drm/card0-eDP-2/enabled")).unwrap(),
+            "disabled"
+        );
+    }
+    #[tokio::test]
+    async fn registration_replay_does_not_overwrite_new_keyboard_observation() {
+        let f = fixture("enabled", None).await;
+        std::fs::write(f.root.join("hold-bind"), "").unwrap();
+        let socket = f
+            .state
+            .read()
+            .await
+            .session_agent
+            .socket_path
+            .clone()
+            .unwrap();
+        super::super::daemon::handle_session_registration(
+            &f.state,
+            "desktop".into(),
+            SessionBackend::Gnome,
+            socket,
+            "agent".into(),
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !f.root.join("bind-entered").exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // New monitor observation is authoritative while registration is waiting.
+        f.state.write().await.status.keyboard_attached = true;
+        std::fs::remove_file(f.root.join("hold-bind")).unwrap();
+        timeout(Duration::from_secs(2), async {
+            while f.calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        idle(&f).await;
+        assert!(f.state.read().await.status.keyboard_attached);
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("drm/card0-eDP-2/enabled")).unwrap(),
+            "disabled"
+        );
     }
     #[tokio::test]
     async fn delayed_manual_reply_cannot_preserve_old_ownership() {
@@ -1036,7 +1379,8 @@ mod tests {
         let f = fixture("enabled", None).await;
         let executor = f.state.read().await.display_executor.clone();
         let held = executor.lock().await;
-        super::super::daemon::run_startup_replay_once(f.state.clone(), true, 1.67).await;
+        f.state.write().await.status.keyboard_attached = true;
+        super::super::daemon::run_startup_replay_once(f.state.clone()).await;
         tokio::task::yield_now().await;
         assert_eq!(f.calls.load(Ordering::SeqCst), 0);
         drop(held);

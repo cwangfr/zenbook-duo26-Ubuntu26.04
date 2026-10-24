@@ -82,19 +82,7 @@ pub async fn run() -> Result<(), String> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let cleanup = {
-                let g = cleanup_state.read().await;
-                !g.display_safety.worker_running
-                    && (g.display_safety.pending.is_some()
-                        || g.display_safety.receipt_to_consume.is_some())
-            };
-            if cleanup {
-                let _ = super::dock_transaction::reconcile_pending_dock(
-                    &cleanup_state,
-                    super::dock_transaction::ReconcileMode::LateCleanup,
-                )
-                .await;
-            }
+            cleanup_display_work(&cleanup_state).await;
         }
     });
 
@@ -227,14 +215,8 @@ async fn startup_grace_active_for_display_probe() -> bool {
             .unwrap_or(false)
 }
 
-pub(crate) async fn run_startup_replay_once(
-    state: Arc<RwLock<RuntimeState>>,
-    attached: bool,
-    scale: f64,
-) {
-    let _ =
-        super::dock_transaction::submit_dock_target(&state, attached, scale, DockSource::Startup)
-            .await;
+pub(crate) async fn run_startup_replay_once(state: Arc<RwLock<RuntimeState>>) {
+    let _ = super::dock_transaction::submit_current_dock_target(&state, DockSource::Startup).await;
     finish_startup_replay().await;
 }
 
@@ -392,6 +374,12 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<RuntimeState>>) -> 
                             Err(message) => DaemonResponse::Error { message },
                         }
                     }
+                    Err(message) => DaemonResponse::Error { message },
+                }
+            }
+            DaemonRequest::ApplySensorOrientation { scope, orientation } => {
+                match super::dock_transaction::apply_sensor(&state, scope, orientation).await {
+                    Ok(_) => DaemonResponse::Ack,
                     Err(message) => DaemonResponse::Error { message },
                 }
             }
@@ -574,6 +562,22 @@ async fn handle_lifecycle(
     result
 }
 
+pub(crate) async fn cleanup_display_work(state: &Arc<RwLock<RuntimeState>>) {
+    let cleanup = {
+        let g = state.read().await;
+        !g.display_safety.worker_running
+            && (g.display_safety.pending.is_some() || g.display_safety.receipt_to_consume.is_some())
+    };
+    if cleanup {
+        let _ = super::dock_transaction::reconcile_pending_dock(
+            state,
+            super::dock_transaction::ReconcileMode::LateCleanup,
+        )
+        .await;
+    }
+    super::dock_transaction::resume_dock_target(state).await;
+}
+
 pub(crate) async fn handle_session_registration(
     state: &Arc<RwLock<RuntimeState>>,
     session_id: String,
@@ -584,7 +588,7 @@ pub(crate) async fn handle_session_registration(
     if agent_id.is_empty() {
         return Err("Agent identity is required".into());
     }
-    let (scope, attached, scale) = {
+    let scope = {
         let mut g = state.write().await;
         let scope = DisplayScope {
             boot_id: g.display_safety.boot_id.clone(),
@@ -606,19 +610,17 @@ pub(crate) async fn handle_session_registration(
         g.status.service_active = true;
         g.touch();
         g.save()?;
-        (scope, g.status.keyboard_attached, g.settings.default_scale)
+        scope
     };
     let decision = startup_replay_decision_on_registration().await;
     let state = state.clone();
     tokio::spawn(async move {
         let _ = super::dock_transaction::bind_current_context(&state).await;
         if decision == StartupReplayDecision::Start {
-            run_startup_replay_once(state, attached, scale).await;
+            run_startup_replay_once(state).await;
         } else if decision == StartupReplayDecision::NotPending {
-            let _ = super::dock_transaction::submit_dock_target(
+            let _ = super::dock_transaction::submit_current_dock_target(
                 &state,
-                attached,
-                scale,
                 DockSource::Registration,
             )
             .await;

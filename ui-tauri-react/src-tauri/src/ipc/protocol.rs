@@ -63,6 +63,10 @@ pub enum DaemonRequest {
     ApplyPerformanceMode {
         mode: PerformanceMode,
     },
+    ApplySensorOrientation {
+        scope: DisplayScope,
+        orientation: Orientation,
+    },
     SetOrientation {
         orientation: Orientation,
     },
@@ -172,6 +176,7 @@ pub enum SessionBackend {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionCommand {
     ApplyDisplayMutation {
+        sensor: bool,
         scope: DisplayScope,
         mutation: ManualDisplayMutation,
     },

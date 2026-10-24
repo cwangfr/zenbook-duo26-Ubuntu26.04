@@ -195,13 +195,21 @@ pub(crate) async fn handle_session_command(
                     },
                 }
             }
-            SessionCommand::ApplyDisplayMutation { scope, mutation } => {
-                let kind = match &mutation {
-                    ManualDisplayMutation::Layout { .. } => DisplayMutationKind::ManualLayout,
-                    _ => DisplayMutationKind::ManualOrientation,
+            SessionCommand::ApplyDisplayMutation {
+                scope,
+                mutation,
+                sensor,
+            } => {
+                let kind = if sensor {
+                    DisplayMutationKind::SensorRotation
+                } else {
+                    match &mutation {
+                        ManualDisplayMutation::Layout { .. } => DisplayMutationKind::ManualLayout,
+                        _ => DisplayMutationKind::ManualOrientation,
+                    }
                 };
                 match gate.start_write(kind, scope, None, move || {
-                    super::display_backend::run_manual(mutation, false)
+                    super::display_backend::run_manual(mutation, sensor)
                 }) {
                     Ok(task) => match task.await {
                         Ok(report) => SessionResponse::MutationComplete { report },
@@ -1312,22 +1320,18 @@ async fn watch_rotation(gate: Arc<AgentDisplayGate>) -> Result<(), String> {
         let Some(scope) = gate.snapshot().scope else {
             continue;
         };
-        let mutation = ManualDisplayMutation::Orientation {
-            orientation: orientation.clone(),
-            scale: settings.default_scale,
-        };
-        if let Ok(task) = gate.start_write(
-            DisplayMutationKind::SensorRotation,
-            scope,
-            None,
-            move || super::display_backend::run_manual(mutation, true),
-        ) {
-            if task
-                .await
-                .is_ok_and(|r| matches!(r.status, MutationStatus::Verified))
-            {
-                last_orientation = Some(orientation);
-            }
+        // No local mutation: the daemon persists the obligation before asking
+        // this Agent's gate to execute and verify the sensor operation.
+        let requested = orientation.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            super::client::request(DaemonRequest::ApplySensorOrientation {
+                scope,
+                orientation: requested,
+            })
+        })
+        .await;
+        if matches!(response, Ok(Ok(DaemonResponse::Ack))) {
+            last_orientation = Some(orientation);
         }
     }
 }

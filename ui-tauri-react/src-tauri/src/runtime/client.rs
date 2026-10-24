@@ -10,7 +10,9 @@ pub fn request(request: DaemonRequest) -> Result<DaemonResponse, String> {
         .map_err(|e| format!("Failed to connect to daemon socket: {e}"))?;
     let read_budget = if matches!(
         &request,
-        DaemonRequest::SetOrientation { .. } | DaemonRequest::ApplyDisplayLayout { .. }
+        DaemonRequest::SetOrientation { .. }
+            | DaemonRequest::ApplyDisplayLayout { .. }
+            | DaemonRequest::ApplySensorOrientation { .. }
     ) {
         15
     } else {
