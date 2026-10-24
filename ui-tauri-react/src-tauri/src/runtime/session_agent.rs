@@ -516,10 +516,6 @@ fn build_gnome_dock_mode_args(attached: bool, scale: f64) -> Vec<String> {
             "eDP-1".to_string(),
             "--transform".to_string(),
             "180".to_string(),
-            "--monitor".to_string(),
-            "eDP-2".to_string(),
-            "--mode".to_string(),
-            "off".to_string(),
         ]
     } else {
         vec![
@@ -1464,11 +1460,12 @@ mod tests {
     }
 
     #[test]
-    fn gnome_dock_mode_attached_explicitly_turns_off_secondary_panel() {
+    fn gnome_dock_mode_attached_omits_secondary_from_configuration() {
         let args = build_gnome_dock_mode_args(true, 1.66);
         let joined = args.join(" ");
         assert!(joined.contains("--monitor eDP-1 --transform 180"));
-        assert!(joined.contains("--monitor eDP-2 --mode off"));
+        assert!(!joined.contains("eDP-2"));
+        assert!(!joined.contains("--mode off"));
     }
 
     #[test]
