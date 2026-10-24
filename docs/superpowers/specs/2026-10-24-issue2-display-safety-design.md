@@ -2,7 +2,7 @@
 
 日期：2026-10-24；源码基线：`e0b11760ad23898761e7acedd322dc412ced604a`。
 目标仓库：`cwangfr/zenbook-duo26-Ubuntu26.04`。
-状态：方案 A 已由用户选择；本文待用户批准，不代表实现或部署完成。
+状态：方案 A 与本文已由用户于 2026-10-24 批准（“spec ok”）；不代表实现或部署完成。
 
 ## 1. 意图与范围
 
@@ -192,6 +192,6 @@ boot、daemon 实例、Agent 实例、注册代际或 lifecycle epoch 已变化�
 - [x] 提出 A/B，用户选择 A。
 - [x] 写出本设计。
 - [x] 独立 builder check，处理 lifecycle scope、原子持久化和迟到结果清理缺口；复审结果：nothing important left。
-- [ ] 用户批准设计。
-- [ ] 批准后调用 writing-plans，形成实现计划。
+- [x] 用户批准设计（2026-10-24：“spec ok”）。
+- [x] 批准后调用 writing-plans，形成实现计划：`../plans/2026-10-24-issue2-display-safety.md`。
 - [ ] 按计划实施、测试及代码审阅；部署单独处理。
