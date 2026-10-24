@@ -14,20 +14,16 @@ const BLUETOOTH_BACKLIGHT_RETRY_DELAY: Duration = Duration::from_millis(500);
 const KEYBOARD_ATTACHMENT_STABLE_SAMPLES: u8 = 3;
 
 struct KeyboardAttachmentDebounce {
-    published: bool,
     candidate: Option<(bool, u8)>,
 }
 
 impl KeyboardAttachmentDebounce {
-    fn new(published: bool) -> Self {
-        Self {
-            published,
-            candidate: None,
-        }
+    fn new() -> Self {
+        Self { candidate: None }
     }
 
-    fn observe(&mut self, sample: bool) -> Option<bool> {
-        if sample == self.published {
+    fn observe(&mut self, published: bool, sample: bool) -> Option<bool> {
+        if sample == published {
             self.candidate = None;
             return None;
         }
@@ -42,7 +38,6 @@ impl KeyboardAttachmentDebounce {
             return None;
         }
 
-        self.published = sample;
         self.candidate = None;
         Some(sample)
     }
@@ -51,13 +46,14 @@ impl KeyboardAttachmentDebounce {
 pub fn start(state: Arc<RwLock<RuntimeState>>) {
     let keyboard_state = state.clone();
     tokio::spawn(async move {
-        let mut debounce =
-            KeyboardAttachmentDebounce::new(keyboard_state.read().await.status.keyboard_attached);
+        let mut debounce = KeyboardAttachmentDebounce::new();
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let Some(attached) = debounce.observe(crate::runtime::probe::keyboard_attached())
+            let published = keyboard_state.read().await.status.keyboard_attached;
+            let Some(attached) =
+                debounce.observe(published, crate::runtime::probe::keyboard_attached())
             else {
                 continue;
             };
@@ -654,13 +650,24 @@ mod tests {
 
     #[test]
     fn keyboard_attachment_debounce_ignores_usb_enumeration_bounce() {
-        let mut debounce = KeyboardAttachmentDebounce::new(true);
+        let mut debounce = KeyboardAttachmentDebounce::new();
 
-        assert_eq!(debounce.observe(false), None);
-        assert_eq!(debounce.observe(true), None);
-        assert_eq!(debounce.observe(false), None);
-        assert_eq!(debounce.observe(false), None);
-        assert_eq!(debounce.observe(false), Some(false));
+        assert_eq!(debounce.observe(true, false), None);
+        assert_eq!(debounce.observe(true, true), None);
+        assert_eq!(debounce.observe(true, false), None);
+        assert_eq!(debounce.observe(true, false), None);
+        assert_eq!(debounce.observe(true, false), Some(false));
+    }
+
+    #[test]
+    fn keyboard_attachment_debounce_reconciles_lifecycle_state_changes() {
+        let mut debounce = KeyboardAttachmentDebounce::new();
+
+        assert_eq!(debounce.observe(true, false), None);
+        assert_eq!(debounce.observe(true, false), None);
+        assert_eq!(debounce.observe(false, true), None);
+        assert_eq!(debounce.observe(false, true), None);
+        assert_eq!(debounce.observe(false, true), Some(true));
     }
 }
 
