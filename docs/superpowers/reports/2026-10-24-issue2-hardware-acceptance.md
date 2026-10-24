@@ -7,7 +7,7 @@
 ## 已完成的准备
 
 - 固定候选源码 `db73a686d69ddc5e3fbb8540e1b0ec71372385c5`，独立导出 staging，未修改主工作区产品代码。
-- 本机：`7.0.0-38-generic`，GNOME/Wayland；两块 eDP 面板 sysfs 均为 connected/enabled。用户确认系统显示双屏开启、键盘盖在下屏上；下屏物理画面因遮挡尚未确认，方向与恢复终端确认仍待补充。
+- 本机：`7.0.0-38-generic`，GNOME/Wayland；两块 eDP 面板 sysfs 均为 connected/enabled。用户确认系统显示双屏开启、键盘盖在下屏上；用户随后确认主屏画面正常、方向正常、能够打开终端；画面与恢复入口的预检条件已满足。下屏物理画面因遮挡留待后续验收。
 - 清点了实际 system/user unit、sleep hook、进程和状态文件；旧 shell services/hook 未发现处于运行状态。
 - daemon 和 Agent 都 active，但 protocol-2 daemon 报告 Agent disconnected。现有 state 的 ownership=true 与双屏开启不能作为新版本 ownership 证据，未采用或修改它。
 - 四个 runtime release 二进制及 Tauri UI release 均离线构建成功；五项产物已复制到候选目录并计算 hash。Cargo.lock/package-lock.json 前后 hash 相同。
@@ -44,7 +44,7 @@
 
 1. 单独修复 connector 行的树形前缀解析，先将本机捕获失败用例固化为可提交、脱敏的回归；补充多 logical monitor/connector enabled、primary、scale、position 和 transform 断言。
 2. 修复后运行完整测试与检查，形成新提交；更新部署候选 SHA，重新构建全部五项产物并核验锁文件/hash。当前候选不得直接沿用。
-3. 补齐主屏/方向/终端观察、root 运行 hash和完整回滚材料，再重新判定预检 GO。
+3. 主屏/方向/终端观察已由用户补齐；后续补齐 root 运行 hash 和完整回滚材料，再重新判定预检 GO。
 4. 从统一切换阶段继续；安排一次正常 reboot 后才做计划中的基础实机验收。本次不执行 suspend。
 
 ## 验收矩阵
