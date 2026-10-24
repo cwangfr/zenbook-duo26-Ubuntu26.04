@@ -89,3 +89,20 @@
 | Unknown 后停止自动重发与手动写入 | PASS（只读证据） |
 | 3 轮 Dock、旋转、手动布局、轻量竞争 | BLOCKED，未执行 |
 | 完整 #2 suspend/resume | NOT_STARTED（不在本轮范围） |
+
+## 第二轮部署与首次物理 Dock 操作
+
+用户授权第二轮受控部署。`8ca7fd4` 的五项离线候选经 root 预检、完整备份和哈希核对后统一安装；旧进程退出，三个 unit 保持 enabled。正常重启建立新 boot `e36b83d5-c2fa-4330-a60a-d0ce64f8ce69`。重启后五项 installed hash 匹配候选，daemon/Agent 单实例运行，protocol 3 只读查询正常。启动 Dock 仅派发一次并返回 Verified；两次稳定快照均无 active、receipt、pending、blocked 或 degraded。用户确认主屏和方向正常、键盘覆盖下屏且底屏关闭；协议布局与 DRM 同样显示 eDP-1 enabled/primary、eDP-2 disabled。
+
+用户随后执行第 1 轮的单次键盘分离，主屏和底屏画面均正常，最终协议布局与 DRM 显示两屏 enabled，安全门空闲且无 degraded。但日志显示一次物理分离产生三个串行 Dock operation：USB 样本在约两秒内为 detached → attached → detached，每个边沿均进入 policy 并返回 Verified。没有并行写入，最终目标正确，但不满足“一次物理动作、一次稳定事务”的验收标准，因此没有继续连接键盘或执行剩余 Dock/旋转用例。
+
+根因位于 daemon 的 250ms keyboard USB 轮询：单个样本与已发布状态不同就立即提交策略，没有 USB 枚举稳定窗口。针对现场 `false → true → false` 序列新增回归，先因缺少去抖状态机失败，再实现连续三个相同差异样本（约 750ms）才发布；回到已发布状态会清空候选。代码审查随后发现 lifecycle 会独立更新 RuntimeState，若去抖器缓存启动时基线可能永久压制恢复样本；新增外部状态漂移回归后，将每次观察的基线改为 RuntimeState 当前值。复审确认没有剩余 Critical 或 Important 问题。完整库测试现为 **118 passed, 0 failed**，binary/doc targets、cargo check、格式与 diff 检查通过。固定提交 `559df2e` 已独立导出并完成五项离线 release 构建，导出候选自身的 118 项测试与 binary check 再次通过，锁文件未变化；该去抖候选尚未部署。当前机器仍运行 `8ca7fd4`，保持健康双屏、键盘分离状态。
+
+| 第二轮项目 | 结果 |
+| --- | --- |
+| `8ca7fd4` 统一安装、新 boot、版本/协议/安全门 | PASS |
+| 启动时 attached Dock（底屏关闭） | PASS |
+| 第 1 轮分离后的画面与最终状态 | PASS |
+| 单次分离只产生一个稳定事务 | FAIL：USB 枚举抖动产生 3 个串行 operation |
+| 后续 Dock、旋转、手动布局、竞争用例 | BLOCKED，未执行 |
+| 去抖源码回归、lifecycle 竞态、复审和五项离线候选 | PASS，`559df2e`，未部署 |

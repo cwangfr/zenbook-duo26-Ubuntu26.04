@@ -144,3 +144,9 @@
 用户正常重启后，新 boot 中 daemon/Agent、protocol 3、双屏和主屏画面均可用，但启动自动 Dock 的 GNOME 命令 `--monitor eDP-2 --mode off` 返回 `No mode off available`。Agent gate 与 daemon state 一致进入 `Degraded/Unknown`；没有重复派发，按 Task 6 停止 Task 5。当前安装仍是 `d117a43`，安全门保持阻断，未在同一 boot 回滚或重启服务。只读证据与脱敏结论见 `../reports/2026-10-24-issue2-hardware-acceptance.md`。
 
 无效参数的生产构造已按 RED→GREEN 测试修正于源码提交 `8ca7fd4`。从该提交独立导出并离线构建了五项匹配候选，候选源码 116 项测试、cargo check 与 UI build 通过，锁文件不变；**此修复未部署**。下一次部署须审核当前 `Unknown` 状态、这五项候选和完整回滚条件，并安排新的受控 boot。不能把本次安全阻断记为 Dock 功能通过。
+
+### 第二轮部署与物理操作停止条件（同日）
+
+用户授权第二轮部署后，`8ca7fd4` 五项候选完成 root 预检、完整备份、统一切换和正常重启。新 boot 中版本、protocol 3、单实例、安全门、attached 启动 Dock 及用户画面观察均通过；底屏正确关闭。第 1 轮键盘分离后双屏画面与最终状态正常，但 daemon 日志显示 USB 探测抖动为 detached → attached → detached，产生三个串行且均 Verified 的 Dock operation。按“一次物理操作、等待终态”和“不连续重发”的约束停止后续用例，键盘保持分离、双屏健康。
+
+根因是 250ms USB 轮询将每个单次样本变化立即发布，没有枚举稳定窗口。现场序列的回归先 RED，随后在进入 policy 前增加连续三个相同差异样本的去抖。代码审查发现 lifecycle 也会独立写入 keyboard 状态；第二个 RED→GREEN 回归确保去抖器每次以 RuntimeState 当前值为基线，避免缓存状态与 lifecycle 分叉。完整测试更新为 118 项通过，cargo check、格式和 diff 检查通过；复审没有剩余 Critical 或 Important 问题。固定提交 `559df2e` 的五项离线 release 候选已构建，候选源码 118 项测试与 binary check 再次通过，锁文件不变，尚未部署。下一轮必须重新建立 boot 边界，不能把第二轮第 1 个 Dock 循环记为完整 PASS。
