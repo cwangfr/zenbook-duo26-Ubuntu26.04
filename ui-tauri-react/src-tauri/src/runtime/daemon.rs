@@ -32,10 +32,15 @@ const SESSION_TIMEOUT_DISCONNECT_THRESHOLD: usize = 3;
 #[cfg(test)]
 const DOCK_REPLAY_MAX_ATTEMPTS: usize = 3;
 const STARTUP_GRACE_WINDOW: Duration = Duration::from_secs(5);
+// Mutter can spend several seconds redrawing after s2idle. This only suppresses
+// the non-modeset layout probe. ponytail: 15s ceiling; the agent re-registers
+// every 5s after that. Upgrade path is an explicit session-ready signal.
+const RESUME_GRACE_WINDOW: Duration = Duration::from_secs(15);
 
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SESSION_TIMEOUT_STREAK: AtomicUsize = AtomicUsize::new(0);
 static STARTUP_REPLAY_STATE: OnceLock<Mutex<StartupReplayState>> = OnceLock::new();
+static RESUME_GRACE_UNTIL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
 #[derive(Debug)]
 struct StartupReplayState {
@@ -213,6 +218,27 @@ async fn startup_grace_active_for_display_probe() -> bool {
             .grace_until
             .map(|deadline| now < deadline)
             .unwrap_or(false)
+}
+
+fn resume_grace_cell() -> &'static Mutex<Option<Instant>> {
+    RESUME_GRACE_UNTIL.get_or_init(|| Mutex::new(None))
+}
+
+async fn note_resume_grace() {
+    *resume_grace_cell().lock().await = Some(Instant::now() + RESUME_GRACE_WINDOW);
+}
+
+pub(crate) async fn resume_grace_active() -> bool {
+    let now = Instant::now();
+    resume_grace_cell()
+        .lock()
+        .await
+        .map(|deadline| now < deadline)
+        .unwrap_or(false)
+}
+
+async fn display_probe_grace_active() -> bool {
+    startup_grace_active_for_display_probe().await || resume_grace_active().await
 }
 
 pub(crate) async fn run_startup_replay_once(state: Arc<RwLock<RuntimeState>>) {
@@ -588,6 +614,48 @@ pub(crate) async fn handle_session_registration(
     if agent_id.is_empty() {
         return Err("Agent identity is required".into());
     }
+    let same_agent = {
+        let g = state.read().await;
+        g.session_agent.connected
+            && g.session_agent.socket_path.as_deref() == Some(socket_path.as_str())
+            && g.session_agent
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.agent_id == agent_id)
+    };
+    if same_agent {
+        let refreshed = {
+            let mut g = state.write().await;
+            let still_same = g.session_agent.connected
+                && g.session_agent.socket_path.as_deref() == Some(socket_path.as_str())
+                && g.session_agent
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.agent_id == agent_id);
+            if still_same {
+                g.session_agent.session_id = Some(session_id.clone());
+                g.session_agent.backend = Some(backend.clone());
+                g.status.service_active = true;
+                let scope = g
+                    .session_agent
+                    .scope
+                    .clone()
+                    .ok_or("No verified display scope")?;
+                g.touch();
+                g.save()?;
+                Some(scope)
+            } else {
+                None
+            }
+        };
+        if let Some(scope) = refreshed {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = super::dock_transaction::bind_current_context(&state).await;
+            });
+            return Ok(scope);
+        }
+    }
     let scope = {
         let mut g = state.write().await;
         let scope = DisplayScope {
@@ -728,8 +796,8 @@ pub(crate) async fn request_session(
     let is_display_probe_command = matches!(command, SessionCommand::GetDisplayLayout);
     let timeout_for_command = session_timeout_for_command(&command);
     let disconnect_on_timeout = disconnect_on_failure && should_disconnect_on_timeout(&command);
-    let relax_disconnect_for_startup =
-        is_display_probe_command && startup_grace_active_for_display_probe().await;
+    let relax_disconnect_for_probe =
+        is_display_probe_command && display_probe_grace_active().await;
 
     let socket_path = {
         let guard = state.read().await;
@@ -753,12 +821,12 @@ pub(crate) async fn request_session(
             return Err(format!("Failed to connect to session agent: {e}"));
         }
         Err(_) => {
-            if disconnect_on_timeout && !relax_disconnect_for_startup {
+            if disconnect_on_timeout && !relax_disconnect_for_probe {
                 mark_session_agent_disconnected(&state, "Timed out connecting to session agent")
                     .await;
-            } else if disconnect_on_timeout && relax_disconnect_for_startup {
+            } else if disconnect_on_timeout && relax_disconnect_for_probe {
                 let _ = logger::append_line(
-                    "rust-daemon: startup grace active, suppressing disconnect on display probe connect-timeout"
+                    "rust-daemon: display probe grace active, suppressing disconnect on connect-timeout"
                         .to_string(),
                 );
             }
@@ -822,12 +890,12 @@ pub(crate) async fn request_session(
                         SESSION_TIMEOUT_STREAK.store(0, Ordering::Relaxed);
                     }
                 }
-            } else if disconnect_on_timeout && !relax_disconnect_for_startup {
+            } else if disconnect_on_timeout && !relax_disconnect_for_probe {
                 mark_session_agent_disconnected(&state, "Timed out waiting for session response")
                     .await;
-            } else if disconnect_on_timeout && relax_disconnect_for_startup {
+            } else if disconnect_on_timeout && relax_disconnect_for_probe {
                 let _ = logger::append_line(
-                    "rust-daemon: startup grace active, suppressing disconnect on display probe response-timeout"
+                    "rust-daemon: display probe grace active, suppressing disconnect on response-timeout"
                         .to_string(),
                 );
             }
@@ -1251,6 +1319,9 @@ pub(crate) async fn advance_display_epoch(
     state: &Arc<RwLock<RuntimeState>>,
     phase: LifecyclePhase,
 ) -> Result<(), String> {
+    if matches!(phase, LifecyclePhase::Post | LifecyclePhase::Thaw) {
+        note_resume_grace().await;
+    }
     let registered = {
         let mut g = state.write().await;
         g.display_safety.lifecycle_epoch = g
@@ -1285,8 +1356,11 @@ pub(crate) async fn advance_display_epoch(
     };
     if registered {
         if let Err(reason) = super::dock_transaction::bind_current_context(state).await {
-            super::dock_transaction::degrade(state, reason.clone()).await;
-            return Err(reason);
+            // Bind publishes policy only. A timeout here is not an unknown modeset.
+            log::warn!("display scope bind deferred after lifecycle event: {reason}");
+            let _ = logger::append_line(format!(
+                "rust-daemon: display scope bind deferred after lifecycle event: {reason}"
+            ));
         }
     }
     Ok(())

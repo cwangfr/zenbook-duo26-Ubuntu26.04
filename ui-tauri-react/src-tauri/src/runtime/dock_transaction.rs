@@ -775,13 +775,18 @@ mod tests {
                                 snapshot: g.snapshot(),
                             }
                         }
-                        SessionCommand::GetDisplayLayout => SessionResponse::DisplayLayout {
-                            layout: layout(
-                                std::fs::read_to_string(r.join("drm/card0-eDP-2/enabled"))
-                                    .unwrap_or_default()
-                                    == "enabled",
-                            ),
-                        },
+                        SessionCommand::GetDisplayLayout => {
+                            while r.join("hold-layout").exists() {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            SessionResponse::DisplayLayout {
+                                layout: layout(
+                                    std::fs::read_to_string(r.join("drm/card0-eDP-2/enabled"))
+                                        .unwrap_or_default()
+                                        == "enabled",
+                                ),
+                            }
+                        }
                         SessionCommand::ApplyDockOperation { operation } => {
                             c.fetch_add(1, Ordering::SeqCst);
                             if r.join("race-revision").exists() {
@@ -1291,14 +1296,13 @@ mod tests {
     async fn registration_replay_does_not_overwrite_new_keyboard_observation() {
         let f = fixture("enabled", None).await;
         std::fs::write(f.root.join("hold-bind"), "").unwrap();
-        let socket = f
-            .state
-            .read()
-            .await
-            .session_agent
-            .socket_path
-            .clone()
-            .unwrap();
+        let socket = {
+            let mut g = f.state.write().await;
+            let socket = g.session_agent.socket_path.clone().unwrap();
+            g.session_agent.connected = false;
+            g.session_agent.scope = None;
+            socket
+        };
         super::super::daemon::handle_session_registration(
             &f.state,
             "desktop".into(),
@@ -1408,14 +1412,13 @@ mod tests {
         assert_eq!(f.calls.load(Ordering::SeqCst), 1);
         let n = Arc::new(tokio::sync::Notify::new());
         let f = fixture("enabled", Some(n.clone())).await;
-        let socket = f
-            .state
-            .read()
-            .await
-            .session_agent
-            .socket_path
-            .clone()
-            .unwrap();
+        let socket = {
+            let mut g = f.state.write().await;
+            let socket = g.session_agent.socket_path.clone().unwrap();
+            g.session_agent.connected = false;
+            g.session_agent.scope = None;
+            socket
+        };
         timeout(
             Duration::from_millis(300),
             super::super::daemon::handle_session_registration(
@@ -1530,6 +1533,103 @@ mod tests {
             .await
             .unwrap();
         assert!(f.state.read().await.secondary_panel_disabled_by_runtime);
+    }
+    #[tokio::test]
+    async fn resume_bind_timeout_does_not_degrade_and_layout_probe_stays_connected() {
+        let f = fixture("enabled", None).await;
+        std::fs::write(f.root.join("hold-bind"), "").unwrap();
+        timeout(
+            Duration::from_secs(3),
+            super::super::daemon::advance_display_epoch(&f.state, LifecyclePhase::Post),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        std::fs::remove_file(f.root.join("hold-bind")).unwrap();
+        {
+            let g = f.state.read().await;
+            assert!(g.display_safety.degraded.is_none());
+            assert!(g.display_safety.manual_allowed);
+            assert!(!g.display_safety.suspended);
+            assert!(g.session_agent.connected);
+        }
+        assert!(super::super::daemon::resume_grace_active().await);
+        std::fs::write(f.root.join("hold-layout"), "").unwrap();
+        let err = timeout(
+            Duration::from_secs(5),
+            super::super::daemon::request_session(
+                f.state.clone(),
+                SessionCommand::GetDisplayLayout,
+                true,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        std::fs::remove_file(f.root.join("hold-layout")).unwrap();
+        assert!(err.contains("Timed out"));
+        let g = f.state.read().await;
+        assert!(g.session_agent.connected);
+        assert!(g.display_safety.degraded.is_none());
+    }
+    #[tokio::test]
+    async fn same_agent_refresh_keeps_generation_and_does_not_clear_degraded() {
+        let f = fixture("enabled", None).await;
+        let (agent_id, socket, generation) = {
+            let mut g = f.state.write().await;
+            g.display_safety.manual_pending = true;
+            g.display_safety.manual_allowed = false;
+            g.display_safety.degraded = Some("Display result is unknown".into());
+            let scope = g.session_agent.scope.clone().unwrap();
+            (
+                scope.agent_id,
+                g.session_agent.socket_path.clone().unwrap(),
+                scope.registration_generation,
+            )
+        };
+        let returned = super::super::daemon::handle_session_registration(
+            &f.state,
+            "sid".into(),
+            SessionBackend::Gnome,
+            socket,
+            agent_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(returned.registration_generation, generation);
+        let g = f.state.read().await;
+        assert_eq!(
+            g.display_safety.degraded.as_deref(),
+            Some("Display result is unknown")
+        );
+        assert!(g.display_safety.manual_pending);
+        assert!(!g.display_safety.manual_allowed);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn different_agent_registration_still_invalidates_pending_work() {
+        let f = fixture("enabled", None).await;
+        let socket = {
+            let mut g = f.state.write().await;
+            g.display_safety.manual_pending = true;
+            g.session_agent.socket_path.clone().unwrap()
+        };
+        super::super::daemon::handle_session_registration(
+            &f.state,
+            "sid".into(),
+            SessionBackend::Gnome,
+            socket,
+            "other-agent".into(),
+        )
+        .await
+        .unwrap();
+        let g = f.state.read().await;
+        assert_eq!(
+            g.display_safety.degraded.as_deref(),
+            Some("Registration changed while a display operation was pending")
+        );
+        assert!(!g.display_safety.manual_allowed);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
     }
     #[tokio::test]
     async fn safety_fast_keyboard_publication_cannot_be_undone_by_slow_probe() {

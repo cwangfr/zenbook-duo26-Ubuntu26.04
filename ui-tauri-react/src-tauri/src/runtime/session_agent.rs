@@ -22,6 +22,7 @@ use crate::models::Orientation;
 use crate::runtime::{paths, state::RuntimeState};
 
 const DOCK_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
+const REREGISTER_INTERVAL: Duration = Duration::from_secs(5);
 const DOCK_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
 const KEYBOARD_BACKLIGHT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -31,7 +32,22 @@ pub async fn run() -> Result<(), String> {
 
     let backend = wait_for_ready_backend().await?;
     let gate = Arc::new(AgentDisplayGate::new(new_identity()?));
-    register_with_daemon(backend, gate.clone()).await?;
+    register_with_daemon(backend.clone(), gate.clone()).await?;
+    let refresh_backend = backend.clone();
+    let refresh_gate = gate.clone();
+    tokio::spawn(async move {
+        let mut tick = interval(REREGISTER_INTERVAL);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if let Err(err) =
+                register_with_daemon(refresh_backend.clone(), refresh_gate.clone()).await
+            {
+                log::warn!("session-agent re-register deferred: {err}");
+            }
+        }
+    });
     let rotation_gate = gate.clone();
     tokio::spawn(async move {
         if let Err(err) = watch_rotation(rotation_gate).await {
