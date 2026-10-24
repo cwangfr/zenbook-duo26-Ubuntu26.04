@@ -56,7 +56,9 @@ fn stacked_logical_height(display: &DisplayInfo) -> i32 {
         display.height
     };
     let scale = display.scale.max(0.1);
-    (physical_height as f64 / scale).ceil() as i32
+    // Mutter and gdctl size a logical monitor with round(px / scale).
+    // ceil() leaves a 1px gap when the quotient is just above an integer.
+    (physical_height as f64 / scale).round() as i32
 }
 
 pub fn normalize_display_layout(layout: DisplayLayout) -> DisplayLayout {
@@ -1378,6 +1380,37 @@ Logical monitors:
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--mode", "2880x1800@144.000"]));
+    }
+
+    #[test]
+    fn gnome_layout_stacks_secondary_on_rounded_logical_edge() {
+        let scale = 1.6666666269302368;
+        let mode = make_display_mode(2880, 1800, 144.0);
+        let panel = |connector: &str, y: i32, transform: u32, primary: bool| DisplayInfo {
+            connector: connector.into(),
+            width: 2880,
+            height: 1800,
+            refresh_rate: 144.0,
+            scale,
+            x: 0,
+            y,
+            transform,
+            primary,
+            enabled: true,
+            current_mode: mode.clone(),
+            available_modes: vec![mode.clone()],
+            refresh_policy: RefreshPolicy::Fixed,
+            supports_dynamic_refresh: false,
+        };
+        let layout = normalize_display_layout(DisplayLayout {
+            displays: vec![panel("eDP-1", 0, 180, true), panel("eDP-2", 9999, 0, false)],
+        });
+        let args = build_gnome_display_layout_args(&layout).expect("layout args");
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("--monitor eDP-2 --mode 2880x1800@144.000 --x 0 --y 1080"),
+            "{joined}"
+        );
     }
 
     #[test]
