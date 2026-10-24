@@ -12,26 +12,40 @@ const SECONDARY_BACKLIGHT_CANDIDATES: [&str; 3] = [
     "/sys/class/backlight/asus_screenpad",
 ];
 
-/// xe can leave the secondary connector present but disable its pipe after an
-/// attached-keyboard boot failure. Do not modeset that pipe again until the
-/// driver reports it enabled.
-pub fn secondary_panel_enabled() -> bool {
-    fs::read_dir("/sys/class/drm")
-        .ok()
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
+pub fn observe_secondary_panel(
+    drm_root: &Path,
+) -> crate::runtime::display_safety::PanelObservation {
+    use crate::runtime::display_safety::PanelObservation;
+    let read = || -> Result<PanelObservation, String> {
+        let mut result = None;
+        for entry in fs::read_dir(drm_root).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
             let name = entry.file_name();
-            let name = name.to_str()?;
-            (name.starts_with("card") && name.ends_with("-eDP-2"))
-                .then_some(entry.path().join("enabled"))
-        })
-        .any(|path| {
-            fs::read_to_string(path)
-                .map(|contents| contents.trim() == "enabled")
-                .unwrap_or(false)
-        })
+            let name = name.to_string_lossy();
+            if !name.starts_with("card") || !name.ends_with("-eDP-2") {
+                continue;
+            }
+            if result.is_some() {
+                return Err("Ambiguous secondary connector".into());
+            }
+            let raw =
+                fs::read_to_string(entry.path().join("enabled")).map_err(|e| e.to_string())?;
+            result = Some(match raw.trim() {
+                "enabled" => PanelObservation::Enabled,
+                "disabled" => PanelObservation::Disabled,
+                other => return Err(format!("Unknown connector state: {other}")),
+            });
+        }
+        result.ok_or_else(|| "Secondary connector not found".into())
+    };
+    read().unwrap_or_else(|reason| PanelObservation::Unknown { reason })
+}
+
+pub fn secondary_panel_enabled() -> bool {
+    matches!(
+        observe_secondary_panel(Path::new("/sys/class/drm")),
+        crate::runtime::display_safety::PanelObservation::Enabled
+    )
 }
 
 fn load_runtime_state() -> Option<RuntimeState> {
@@ -217,6 +231,29 @@ pub fn read_log_lines(count: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_observation_does_not_confuse_missing_or_bad_input_with_disabled() {
+        use crate::runtime::display_safety::PanelObservation;
+        let root = std::env::temp_dir().join(format!("duo-panel-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        assert!(matches!(
+            observe_secondary_panel(&root),
+            PanelObservation::Unknown { .. }
+        ));
+        fs::create_dir_all(root.join("card0-eDP-2")).unwrap();
+        let path = root.join("card0-eDP-2/enabled");
+        fs::write(&path, "disabled\n").unwrap();
+        assert_eq!(observe_secondary_panel(&root), PanelObservation::Disabled);
+        fs::write(&path, "enabled\n").unwrap();
+        assert_eq!(observe_secondary_panel(&root), PanelObservation::Enabled);
+        fs::write(&path, "garbled").unwrap();
+        assert!(matches!(
+            observe_secondary_panel(&root),
+            PanelObservation::Unknown { .. }
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn prefers_usb_when_both_transport_interfaces_are_visible() {

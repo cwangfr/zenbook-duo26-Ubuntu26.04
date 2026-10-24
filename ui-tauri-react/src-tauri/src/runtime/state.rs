@@ -1,6 +1,8 @@
+use crate::runtime::store::RuntimeStore;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::sync::Arc;
 
 use crate::ipc::protocol::SessionBackend;
 use crate::models::{DuoSettings, DuoStatus, HardwareEvent, PerformanceMode};
@@ -9,6 +11,10 @@ use crate::runtime::paths;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeState {
+    #[serde(skip, default = "default_store")]
+    pub storage: Arc<RuntimeStore>,
+    #[serde(skip)]
+    pub storage_fault: Option<String>,
     pub status: DuoStatus,
     pub settings: DuoSettings,
     pub session_agent: SessionAgentState,
@@ -36,6 +42,8 @@ pub struct RuntimeState {
 impl Default for RuntimeState {
     fn default() -> Self {
         Self {
+            storage: default_store(),
+            storage_fault: None,
             status: DuoStatus::default(),
             settings: DuoSettings::default(),
             session_agent: SessionAgentState::default(),
@@ -106,26 +114,25 @@ impl RuntimeState {
         self.last_updated = Utc::now();
     }
 
-    pub fn load() -> Self {
-        fs::read_to_string(paths::state_file_path())
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+    pub fn load_from(storage: Arc<RuntimeStore>) -> Result<Self, String> {
+        let mut state = storage.load()?.unwrap_or_default();
+        state.storage = storage;
+        Ok(state)
     }
 
     pub fn save(&self) -> Result<(), String> {
-        if let Some(parent) = paths::state_file_path().parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create runtime state dir: {e}"))?;
+        if let Some(reason) = &self.storage_fault {
+            return Err(reason.clone());
         }
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("Failed to serialize runtime state: {e}"))?;
-        fs::write(paths::state_file_path(), json)
-            .map_err(|e| format!("Failed to write runtime state: {e}"))
+        self.storage.save(self)
     }
 }
 
-fn current_boot_id() -> Option<String> {
+fn default_store() -> Arc<RuntimeStore> {
+    Arc::new(RuntimeStore::new(paths::state_file_path()))
+}
+
+pub(crate) fn current_boot_id() -> Option<String> {
     fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
         .map(|value| value.trim().to_string())

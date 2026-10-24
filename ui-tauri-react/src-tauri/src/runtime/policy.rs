@@ -147,6 +147,7 @@ mod tests {
             last_runtime_notification: None,
             last_updated: Utc::now(),
             recent_events: Vec::new(),
+            ..crate::runtime::test_utils::state()
         }
     }
 

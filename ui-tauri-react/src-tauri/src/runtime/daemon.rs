@@ -131,7 +131,15 @@ fn configure_daemon_socket(path: &Path) -> Result<(), String> {
 }
 
 fn initialize_state() -> RuntimeState {
-    let mut state = RuntimeState::load();
+    let storage = Arc::new(crate::runtime::store::RuntimeStore::new(
+        paths::state_file_path(),
+    ));
+    let mut state =
+        RuntimeState::load_from(storage.clone()).unwrap_or_else(|reason| RuntimeState {
+            storage,
+            storage_fault: Some(reason),
+            ..RuntimeState::default()
+        });
     state.status = crate::runtime::probe::current_status();
     state.status.service_active = false;
     state.settings = commands::settings::load_settings_local();
@@ -1318,7 +1326,7 @@ mod tests {
             writer.write_all(b"\n").await.expect("terminate ack");
         });
 
-        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        let state = Arc::new(RwLock::new(crate::runtime::test_utils::state()));
         {
             let mut guard = state.write().await;
             guard.session_agent.connected = true;
@@ -1371,7 +1379,7 @@ mod tests {
             writer.write_all(b"\n").await.expect("terminate ack");
         });
 
-        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        let state = Arc::new(RwLock::new(crate::runtime::test_utils::state()));
         {
             let mut guard = state.write().await;
             guard.status.keyboard_attached = false;
@@ -1407,7 +1415,7 @@ mod tests {
         let socket_path = unique_test_socket_path("register-async");
         let listener = UnixListener::bind(&socket_path).expect("bind test session socket");
 
-        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        let state = Arc::new(RwLock::new(crate::runtime::test_utils::state()));
         {
             let mut guard = state.write().await;
             guard.status.keyboard_attached = true;
@@ -1495,7 +1503,7 @@ mod tests {
             writer.write_all(b"\n").await.expect("terminate error");
         });
 
-        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        let state = Arc::new(RwLock::new(crate::runtime::test_utils::state()));
         {
             let mut guard = state.write().await;
             guard.status.keyboard_attached = true;
@@ -1552,7 +1560,7 @@ mod tests {
             writer.write_all(b"\n").await.expect("terminate ack");
         });
 
-        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        let state = Arc::new(RwLock::new(crate::runtime::test_utils::state()));
         {
             let mut guard = state.write().await;
             guard.status.keyboard_attached = true;
@@ -1629,7 +1637,7 @@ mod tests {
                 .expect_err("startup replay should only issue one dock command");
         });
 
-        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        let state = Arc::new(RwLock::new(crate::runtime::test_utils::state()));
         {
             let mut guard = state.write().await;
             guard.status.keyboard_attached = false;
@@ -1685,7 +1693,7 @@ mod tests {
             startup.grace_until = Some(Instant::now() + Duration::from_secs(1));
         }
 
-        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        let state = Arc::new(RwLock::new(crate::runtime::test_utils::state()));
         {
             let mut guard = state.write().await;
             guard.session_agent.connected = true;
@@ -1747,7 +1755,7 @@ mod tests {
             writer.write_all(b"\n").await.expect("terminate ack");
         });
 
-        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        let state = Arc::new(RwLock::new(crate::runtime::test_utils::state()));
         {
             let mut guard = state.write().await;
             guard.session_agent.connected = true;
@@ -1798,7 +1806,7 @@ mod tests {
                 .expect_err("duplicate notification should be suppressed");
         });
 
-        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        let state = Arc::new(RwLock::new(crate::runtime::test_utils::state()));
         {
             let mut guard = state.write().await;
             guard.session_agent.connected = true;
@@ -1943,7 +1951,7 @@ mod tests {
                 .expect_err("dock replay should stop once an attempt succeeds");
         });
 
-        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        let state = Arc::new(RwLock::new(crate::runtime::test_utils::state()));
         {
             let mut guard = state.write().await;
             guard.session_agent.connected = true;
