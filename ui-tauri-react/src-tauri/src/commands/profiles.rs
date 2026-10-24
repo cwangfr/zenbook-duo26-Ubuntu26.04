@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::hardware::display_config;
 use crate::ipc::protocol::{DaemonRequest, DaemonResponse};
 use crate::models::{Profile, ProfileList};
 use crate::runtime::client;
@@ -71,23 +70,9 @@ pub fn activate_profile(id: String) -> Result<(), String> {
         _ => crate::commands::backlight::set_backlight_daemon_first(profile.backlight_level),
     };
 
-    // Apply orientation
-    let _ = match client::request(DaemonRequest::SetOrientation {
-        orientation: profile.orientation.clone(),
-    }) {
-        Ok(DaemonResponse::Ack) => Ok(()),
-        _ => display_config::set_orientation(&profile.orientation),
-    };
-
-    // Apply display layout if present
-    if let Some(ref layout) = profile.display_layout {
-        let _ = match client::request(DaemonRequest::ApplyDisplayLayout {
-            layout: layout.clone(),
-        }) {
-            Ok(DaemonResponse::Ack) => Ok(()),
-            _ => display_config::apply_display_layout(layout),
-        };
+    crate::commands::display::set_orientation(profile.orientation.clone())?;
+    if let Some(layout) = profile.display_layout {
+        crate::commands::display::apply_display_layout(layout)?;
     }
-
     Ok(())
 }

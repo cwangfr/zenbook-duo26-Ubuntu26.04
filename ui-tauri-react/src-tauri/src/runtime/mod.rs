@@ -37,3 +37,4 @@ pub(crate) mod test_utils {
     }
 }
 pub(crate) mod display_backend;
+pub(crate) mod dock_transaction;

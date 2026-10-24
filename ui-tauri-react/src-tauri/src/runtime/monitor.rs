@@ -389,75 +389,18 @@ async fn apply_policy_actions(state: Arc<RwLock<RuntimeState>>, actions: Vec<Pol
                 }
             }
             PolicyAction::SetDockMode { attached, scale } => {
-                let secondary_panel_was_enabled = crate::hardware::sysfs::secondary_panel_enabled();
-                let secondary_panel_disabled_by_runtime = {
-                    let guard = state.read().await;
-                    guard.secondary_panel_disabled_by_runtime
-                };
-
-                if should_skip_detached_secondary_recovery(
-                    attached,
-                    secondary_panel_was_enabled,
-                    secondary_panel_disabled_by_runtime,
-                ) {
-                    let message = "Skipping automatic dual-screen enable: xe reports eDP-2 disabled after the keyboard transition";
-                    log::warn!("{message}");
-                    crate::runtime::daemon::notify_runtime_error(
-                        &state,
-                        "Zenbook Duo Display Protection",
-                        "The xe driver has disabled eDP-2. Automatic dual-screen recovery was skipped to avoid a compositor freeze; reconnect the keyboard or reboot before retrying.",
-                    )
-                    .await;
-                    let _ = logger::append_line(format!(
-                        "rust-daemon: {message} (attached={}, scale={})",
-                        attached, scale
-                    ));
-                    continue;
-                }
-
                 if let Err(err) =
                     crate::runtime::daemon::forward_or_queue_dock_mode(&state, attached, scale)
                         .await
                 {
-                    if err == "No session agent registered" {
-                        let _ = logger::append_line(format!(
-                            "rust-daemon: recoverable_pending_replay dock-mode policy action (attached={}, scale={}) because no session agent is registered yet",
-                            attached, scale
-                        ));
-                        continue;
-                    }
-                    log::warn!("failed to apply dock-mode policy action: {err}");
-                    crate::runtime::daemon::notify_runtime_error(
-                        &state,
-                        "Zenbook Duo Runtime Error",
-                        &format!("Dock-mode policy action failed: {err}"),
-                    )
-                    .await;
-                    let _ = logger::append_line(format!(
-                        "rust-daemon: dock-mode policy action failed (attached={}, scale={}): {}",
-                        attached, scale, err
-                    ));
-                } else {
-                    let mut guard = state.write().await;
-                    // Preserve ownership across repeated attached syncs. The replay path
-                    // also records this so startup and session-agent re-registration behave
-                    // the same as a physical keyboard transition.
-                    guard.record_successful_dock_mode(attached, secondary_panel_was_enabled);
-                    guard.touch();
-                    if let Err(err) = guard.save() {
-                        log::warn!("failed to save secondary panel dock state: {err}");
-                    }
-                    drop(guard);
-                    let _ = logger::append_line(format!(
-                        "rust-daemon: applied dock-mode policy action (attached={}, scale={})",
-                        attached, scale
-                    ));
+                    log::warn!("Dock intent could not be published: {err}");
                 }
             }
         }
     }
 }
 
+#[cfg(test)]
 fn should_skip_detached_secondary_recovery(
     attached: bool,
     secondary_panel_enabled: bool,

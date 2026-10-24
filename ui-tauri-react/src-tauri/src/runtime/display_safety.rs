@@ -98,6 +98,7 @@ pub struct DisplaySafetyState {
     pub daemon_id: String,
     pub lifecycle_epoch: u64,
     pub pending: Option<DockOperation>,
+    pub manual_pending: bool,
     pub receipt_to_consume: Option<DockReceipt>,
     pub degraded: Option<String>,
     pub manual_allowed: bool,
@@ -115,6 +116,7 @@ impl Default for DisplaySafetyState {
             daemon_id: String::new(),
             lifecycle_epoch: 0,
             pending: None,
+            manual_pending: false,
             receipt_to_consume: None,
             degraded: None,
             manual_allowed: true,
@@ -193,7 +195,8 @@ impl DisplaySafetyState {
     pub fn begin_daemon(&mut self, boot: &str, daemon_id: String) {
         if self.boot_id != boot {
             *self = Self::default();
-        } else if self.pending.is_some() || self.receipt_to_consume.is_some() {
+        } else if self.pending.is_some() || self.receipt_to_consume.is_some() || self.manual_pending
+        {
             self.degraded = Some("Previous daemon left a display operation pending".into());
             self.manual_allowed = false;
         }

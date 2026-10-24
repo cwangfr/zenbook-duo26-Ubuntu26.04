@@ -19,24 +19,37 @@ pub fn get_display_layout() -> Result<DisplayLayout, String> {
 pub fn apply_display_layout(layout: DisplayLayout) -> Result<(), String> {
     let normalized = display_config::normalize_display_layout(layout);
 
-    match client::request(DaemonRequest::ApplyDisplayLayout {
-        layout: normalized.clone(),
-    }) {
-        Ok(DaemonResponse::Ack) => Ok(()),
-        Ok(DaemonResponse::Error { .. }) => display_config::apply_display_layout(&normalized),
-        Ok(_) => display_config::apply_display_layout(&normalized),
-        Err(_) => display_config::apply_display_layout(&normalized),
-    }
+    mutation_result(client::request(DaemonRequest::ApplyDisplayLayout {
+        layout: normalized,
+    }))
 }
 
 #[tauri::command]
 pub fn set_orientation(orientation: Orientation) -> Result<(), String> {
-    match client::request(DaemonRequest::SetOrientation {
-        orientation: orientation.clone(),
-    }) {
-        Ok(DaemonResponse::Ack) => Ok(()),
-        Ok(DaemonResponse::Error { .. }) => display_config::set_orientation(&orientation),
-        Ok(_) => display_config::set_orientation(&orientation),
-        Err(_) => display_config::set_orientation(&orientation),
+    mutation_result(client::request(DaemonRequest::SetOrientation {
+        orientation,
+    }))
+}
+
+pub(crate) fn mutation_result(response: Result<DaemonResponse, String>) -> Result<(), String> {
+    match response? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error { message } => Err(message),
+        _ => Err("Unexpected display mutation response".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rejected_or_unreachable_daemon_never_becomes_mutation_success() {
+        assert!(mutation_result(Err("socket unavailable".into())).is_err());
+        assert!(mutation_result(Ok(DaemonResponse::Error {
+            message: "display protection".into()
+        }))
+        .is_err());
+        assert!(mutation_result(Ok(DaemonResponse::Pong)).is_err());
+        assert!(mutation_result(Ok(DaemonResponse::Ack)).is_ok());
     }
 }

@@ -99,6 +99,8 @@ pub enum DaemonRequest {
 pub enum DaemonResponse {
     SessionRegistered {
         scope: DisplayScope,
+        automatic_blocked: bool,
+        manual_allowed: bool,
     },
     Pong,
     Ack,

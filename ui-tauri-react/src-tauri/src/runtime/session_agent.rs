@@ -117,7 +117,11 @@ async fn register_with_daemon(
         .map_err(|e| format!("Invalid daemon registration response: {e}"))?;
     envelope.validate()?;
     match envelope.payload {
-        DaemonResponse::SessionRegistered { scope } => gate.bind_scope(scope),
+        DaemonResponse::SessionRegistered {
+            scope,
+            automatic_blocked,
+            manual_allowed,
+        } => gate.bind_context(scope, automatic_blocked, manual_allowed),
         DaemonResponse::Error { message } => Err(message),
         other => Err(format!(
             "Unexpected daemon registration response: {other:?}"
@@ -197,8 +201,10 @@ pub(crate) async fn handle_session_command(
                             message: e.to_string(),
                         },
                     },
-                    Err(reject) => SessionResponse::Error {
-                        message: format!("Display change rejected: {reject:?}"),
+                    Err(reject) => SessionResponse::MutationComplete {
+                        report: MutationReport::not_started(format!(
+                            "Display change rejected: {reject:?}"
+                        )),
                     },
                 }
             }

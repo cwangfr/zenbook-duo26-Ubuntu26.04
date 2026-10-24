@@ -15,6 +15,10 @@ pub struct RuntimeState {
     pub storage: Arc<RuntimeStore>,
     #[serde(skip)]
     pub storage_fault: Option<String>,
+    #[serde(skip, default = "default_drm_root")]
+    pub drm_root: std::path::PathBuf,
+    #[serde(skip)]
+    pub display_executor: Arc<tokio::sync::Mutex<()>>,
     #[serde(default)]
     pub display_safety: crate::runtime::display_safety::DisplaySafetyState,
     pub status: DuoStatus,
@@ -46,6 +50,8 @@ impl Default for RuntimeState {
         Self {
             storage: default_store(),
             storage_fault: None,
+            drm_root: default_drm_root(),
+            display_executor: Default::default(),
             display_safety: Default::default(),
             status: DuoStatus::default(),
             settings: DuoSettings::default(),
@@ -131,6 +137,10 @@ impl RuntimeState {
         }
         self.storage.save(self)
     }
+}
+
+fn default_drm_root() -> std::path::PathBuf {
+    "/sys/class/drm".into()
 }
 
 fn default_store() -> Arc<RuntimeStore> {

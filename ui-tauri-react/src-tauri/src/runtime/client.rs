@@ -8,8 +8,16 @@ use crate::runtime::paths;
 pub fn request(request: DaemonRequest) -> Result<DaemonResponse, String> {
     let mut stream = UnixStream::connect(paths::daemon_socket_path())
         .map_err(|e| format!("Failed to connect to daemon socket: {e}"))?;
+    let read_budget = if matches!(
+        &request,
+        DaemonRequest::SetOrientation { .. } | DaemonRequest::ApplyDisplayLayout { .. }
+    ) {
+        15
+    } else {
+        3
+    };
     stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
+        .set_read_timeout(Some(Duration::from_secs(read_budget)))
         .map_err(|e| format!("Failed to set daemon read timeout: {e}"))?;
     stream
         .set_write_timeout(Some(Duration::from_secs(3)))
