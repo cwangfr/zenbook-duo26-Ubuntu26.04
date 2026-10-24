@@ -84,6 +84,62 @@ pub(crate) async fn run_dock(operation: DockOperation) -> MutationReport {
     .unwrap_or_else(|_| MutationReport::unknown("Display readback worker failed"))
 }
 
+pub(crate) fn classify_manual_layout(
+    command: &Result<(), String>,
+    previous: &DisplayLayout,
+    actual: Result<&DisplayLayout, &str>,
+    requested: &DisplayLayout,
+) -> MutationStatus {
+    let Ok(actual) = actual else {
+        return MutationStatus::Unknown {
+            reason: "Requested display layout could not be verified".into(),
+        };
+    };
+    if command.is_ok() && request_matches(requested, actual) {
+        return MutationStatus::Verified;
+    }
+    if let Err(reason) = command {
+        if layouts_unchanged(previous, actual) {
+            return MutationStatus::KnownFailure {
+                reason: reason.clone(),
+            };
+        }
+    }
+    MutationStatus::Unknown {
+        reason: "Requested display layout could not be verified".into(),
+    }
+}
+
+fn request_matches(requested: &DisplayLayout, actual: &DisplayLayout) -> bool {
+    requested.displays.iter().all(|want| {
+        actual.displays.iter().any(|display| {
+            display.connector == want.connector
+                && display.enabled == want.enabled
+                && (!want.enabled
+                    || (display.transform == want.transform
+                        && (display.scale - want.scale).abs() < 0.02))
+        })
+    })
+}
+
+fn layouts_unchanged(previous: &DisplayLayout, actual: &DisplayLayout) -> bool {
+    if previous.displays.len() != actual.displays.len() {
+        return false;
+    }
+    previous.displays.iter().all(|old| {
+        actual.displays.iter().any(|display| {
+            display.connector == old.connector
+                && display.enabled == old.enabled
+                && display.primary == old.primary
+                && display.transform == old.transform
+                && display.x == old.x
+                && display.y == old.y
+                && display.current_mode.mode_id == old.current_mode.mode_id
+                && (display.scale - old.scale).abs() < 0.02
+        })
+    })
+}
+
 pub(crate) async fn run_manual(mutation: ManualDisplayMutation, sensor: bool) -> MutationReport {
     tokio::task::spawn_blocking(move || {
         let before = sysfs::observe_secondary_panel(Path::new("/sys/class/drm"));
@@ -112,47 +168,51 @@ pub(crate) async fn run_manual(mutation: ManualDisplayMutation, sensor: bool) ->
                 display_config::set_orientation_with_scale(orientation, *scale)
             }
         };
+        let command_status = match &result {
+            Ok(()) => Ok(()),
+            Err(reason) => Err(reason.clone()),
+        };
         let after_layout = display_config::get_display_layout();
-        let verified = after_layout.as_ref().is_ok_and(|actual| match &mutation {
-            ManualDisplayMutation::Layout { layout } => layout.displays.iter().all(|want| {
-                actual.displays.iter().any(|d| {
-                    d.connector == want.connector
-                        && d.enabled == want.enabled
-                        && (!want.enabled
-                            || (d.transform == want.transform
-                                && (d.scale - want.scale).abs() < 0.02))
-                })
-            }),
-            ManualDisplayMutation::Orientation { orientation, .. } => {
-                let transform = match orientation {
-                    crate::models::Orientation::Normal => 180,
-                    crate::models::Orientation::Left => 90,
-                    crate::models::Orientation::Right => 270,
-                    crate::models::Orientation::Inverted => 0,
-                };
-                actual
-                    .displays
-                    .iter()
-                    .any(|d| d.connector == "eDP-1" && d.enabled && d.transform == transform)
-                    && previous.displays.iter().all(|old| {
-                        actual
-                            .displays
-                            .iter()
-                            .any(|d| d.connector == old.connector && d.enabled == old.enabled)
-                    })
-            }
-        });
         let mut report = confirmed_report(
             before,
             result,
             sysfs::observe_secondary_panel(Path::new("/sys/class/drm")),
-            after_layout,
+            after_layout.clone(),
             None,
         );
-        if !verified {
-            report.status = MutationStatus::Unknown {
-                reason: "Requested display layout could not be verified".into(),
-            };
+        match &mutation {
+            ManualDisplayMutation::Layout { layout } => {
+                report.status = classify_manual_layout(
+                    &command_status,
+                    &previous,
+                    after_layout.as_ref().map_err(|error| error.as_str()),
+                    layout,
+                );
+            }
+            ManualDisplayMutation::Orientation { orientation, .. } => {
+                let verified = after_layout.as_ref().is_ok_and(|actual| {
+                    let transform = match orientation {
+                        crate::models::Orientation::Normal => 180,
+                        crate::models::Orientation::Left => 90,
+                        crate::models::Orientation::Right => 270,
+                        crate::models::Orientation::Inverted => 0,
+                    };
+                    actual.displays.iter().any(|display| {
+                        display.connector == "eDP-1"
+                            && display.enabled
+                            && display.transform == transform
+                    }) && previous.displays.iter().all(|old| {
+                        actual.displays.iter().any(|display| {
+                            display.connector == old.connector && display.enabled == old.enabled
+                        })
+                    })
+                });
+                if !verified {
+                    report.status = MutationStatus::Unknown {
+                        reason: "Requested display layout could not be verified".into(),
+                    };
+                }
+            }
         }
         report
     })
@@ -163,6 +223,100 @@ pub(crate) async fn run_manual(mutation: ManualDisplayMutation, sensor: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{DisplayInfo, DisplayMode, RefreshPolicy};
+
+    fn sample_layout(secondary_scale: f64) -> DisplayLayout {
+        DisplayLayout {
+            displays: [("eDP-1", 1.666667, 0), ("eDP-2", secondary_scale, 1081)]
+                .into_iter()
+                .map(|(connector, scale, y)| DisplayInfo {
+                    connector: connector.into(),
+                    width: 2880,
+                    height: 1800,
+                    refresh_rate: 144.0,
+                    scale,
+                    x: 0,
+                    y,
+                    transform: if connector == "eDP-1" { 180 } else { 0 },
+                    primary: connector == "eDP-1",
+                    enabled: true,
+                    current_mode: DisplayMode {
+                        mode_id: "2880x1800@144".into(),
+                        width: 2880,
+                        height: 1800,
+                        refresh_rate: 144.0,
+                    },
+                    available_modes: vec![],
+                    refresh_policy: RefreshPolicy::Fixed,
+                    supports_dynamic_refresh: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn manual_layout_known_failure_when_readback_unchanged() {
+        let previous = sample_layout(1.666667);
+        let requested = sample_layout(1.5);
+        let status = classify_manual_layout(
+            &Err("gdctl set failed: scale rejected".into()),
+            &previous,
+            Ok(&previous),
+            &requested,
+        );
+        assert_eq!(
+            status,
+            MutationStatus::KnownFailure {
+                reason: "gdctl set failed: scale rejected".into()
+            }
+        );
+    }
+
+    #[test]
+    fn manual_layout_known_failure_not_when_readback_changed() {
+        let previous = sample_layout(1.666667);
+        let mut changed = previous.clone();
+        changed.displays[1].scale = 1.5;
+        let status = classify_manual_layout(
+            &Err("gdctl set failed: partial".into()),
+            &previous,
+            Ok(&changed),
+            &changed,
+        );
+        assert!(matches!(status, MutationStatus::Unknown { .. }));
+    }
+
+    #[test]
+    fn manual_layout_known_failure_not_when_success_unmatched() {
+        let previous = sample_layout(1.666667);
+        let status = classify_manual_layout(&Ok(()), &previous, Ok(&previous), &sample_layout(1.5));
+        assert!(matches!(status, MutationStatus::Unknown { .. }));
+    }
+
+    #[test]
+    fn manual_layout_known_failure_not_when_readback_missing() {
+        let previous = sample_layout(1.666667);
+        let status = classify_manual_layout(
+            &Err("gdctl set failed: timeout".into()),
+            &previous,
+            Err("gdctl show failed"),
+            &sample_layout(1.5),
+        );
+        assert!(matches!(status, MutationStatus::Unknown { .. }));
+    }
+
+    #[test]
+    fn manual_layout_known_failure_not_used_for_matching_success() {
+        let requested = sample_layout(1.5);
+        let status = classify_manual_layout(
+            &Ok(()),
+            &sample_layout(1.666667),
+            Ok(&requested),
+            &requested,
+        );
+        assert_eq!(status, MutationStatus::Verified);
+    }
+
     #[test]
     fn readback_failure_after_command_success_is_unknown() {
         let r = confirmed_report(

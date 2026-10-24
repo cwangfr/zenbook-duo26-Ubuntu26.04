@@ -615,6 +615,13 @@ async fn apply_non_dock(
         Ok(SessionResponse::MutationComplete { report }) => {
             let mut g = state.write().await;
             let current = scope_of(&g).is_ok_and(|s| s == scope);
+            if let MutationStatus::KnownFailure { reason } = &report.status {
+                if current {
+                    g.display_safety.manual_pending = false;
+                    save(&mut g)?;
+                    return Err(reason.clone());
+                }
+            }
             if current
                 && matches!(
                     report.status,
@@ -849,6 +856,19 @@ mod tests {
                             let before =
                                 crate::hardware::sysfs::observe_secondary_panel(&r.join("drm"));
                             match g.start_write(kind, scope, None, move || async move {
+                                if r.join("known-layout-failure").exists() {
+                                    return MutationReport {
+                                        before,
+                                        after: PanelObservation::Enabled,
+                                        primary_enabled: Some(true),
+                                        secondary_enabled: Some(true),
+                                        revision_before: 0,
+                                        revision_after: 0,
+                                        status: MutationStatus::KnownFailure {
+                                            reason: "gdctl set failed: scale rejected".into(),
+                                        },
+                                    };
+                                }
                                 if sensor {
                                     std::fs::write(r.join("sensor-entered"), "").unwrap();
                                     while r.join("hold-sensor").exists() {
@@ -1446,6 +1466,23 @@ mod tests {
         .await
         .unwrap();
         assert!(!f.state.read().await.secondary_panel_disabled_by_runtime);
+    }
+    #[tokio::test]
+    async fn manual_layout_known_failure_does_not_degrade() {
+        let f = fixture("enabled", None).await;
+        std::fs::write(f.root.join("known-layout-failure"), "").unwrap();
+        let err = apply_manual(
+            &f.state,
+            ManualDisplayMutation::Layout {
+                layout: layout(true),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "gdctl set failed: scale rejected");
+        let state = f.state.read().await;
+        assert!(state.display_safety.degraded.is_none());
+        assert!(!state.display_safety.manual_pending);
     }
     #[tokio::test]
     async fn safety_lifecycle_publishes_target_even_when_backlight_fails() {
