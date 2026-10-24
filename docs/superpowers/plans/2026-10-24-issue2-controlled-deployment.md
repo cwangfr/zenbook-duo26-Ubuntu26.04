@@ -12,16 +12,16 @@
 
 ## 当前基线和方案选择
 
-- 候选源码固定为 `db73a686d69ddc5e3fbb8540e1b0ec71372385c5`；其运行时代码修复提交为 `4c96f31`。本计划的文档提交不改变这个候选版本。
-- 已完成 115 个库测试、全部 binary/doc targets、binary check、前端构建、格式检查和两项 shell 测试。尚未完成 release 全套构建、安装与实机验收。
-- 沿用用户已选择的 Native 执行方式。用户本次要求设计计划，尚未要求实际安装、停止服务或重启电脑。
+- 原候选 `db73a686d69ddc5e3fbb8540e1b0ec71372385c5` 已因真实双屏解析缺陷废弃；修复后的新候选固定为 `d117a43685226ac45f57047fddcd7e94323e42d0`。运行时安全修复仍包含提交 `4c96f31`。
+- 原候选 115 项库测试通过；解析修复后固定候选 116 项通过、本机捕获文本的诊断回归通过，binary check、前端构建和五项离线 release 构建通过。统一安装已完成，等待重启及实机验收。
+- 沿用用户已选择的 Native 执行方式。用户随后明确要求开始并继续执行部署，确认工作已保存、可以正常重启。
 - **推荐：分阶段构建、统一切换、逐项验收。** 可以在停服务前审查全部候选产物与回滚材料。
 - 全量运行 `install.sh` 会涉及额外系统配置；直接运行 `install-rust-runtime.sh` 会自行安装并重启 daemon/lifecycle/Agent，且不统一更新 UI。两者均不作为本轮切换命令。
 - 先继续实现 #1 可推迟部署，但无法获得当前修复的硬件证据，且扩大待验证变更；本轮只完成这份部署验收。
 
 ## Global Constraints
 
-- 本次编写计划不执行构建、安装、服务控制、真实 modeset 或 reboot；后续明确要求执行部署时才进入相应任务。
+- 本计划已进入用户要求的执行阶段；重启与真实显示操作仍按下述阶段门逐项核验。
 - 所有五个参与二进制来自同一候选源码：daemon、session-agent、lifecycle、usb-remap-helper、Tauri control UI；禁止混用旧 UI/tray。
 - 不运行全量安装器，不升级内核、固件、驱动或依赖，不改 GDM、udev、蓝牙策略、休眠策略；不启用原来禁用的功能或旧服务。
 - 不做 suspend/hibernate、反复重启、强杀、故意磁盘满、损坏真实状态或实际后端超时注入；这些故障继续使用已完成的模拟测试证据。
@@ -129,4 +129,18 @@
 
 ## 本次执行进度（2026-10-24）
 
-用户已要求开始执行。状态：**BLOCKED_BEFORE_DEPLOYMENT**。Task 1 只读预检发现真实双屏 `gdctl` 输出的主屏解析缺陷，独立捕获回归已失败；Task 2 的离线五项 release 构建、既有 115 项测试及只读备份已完成主要部分，完整回滚/root 核验仍待补齐。Task 3—5 未开始，没有安装、停服或 reboot。按 Task 6 的停止条件保存证据；先另行修复 parser、更新候选 SHA 后继续。详见 `../reports/2026-10-24-issue2-hardware-acceptance.md`。
+用户已要求开始执行。首次预检阶段状态：**BLOCKED_BEFORE_DEPLOYMENT**。Task 1 只读预检发现真实双屏 `gdctl` 输出的主屏解析缺陷，独立捕获回归已失败；Task 2 的离线五项 release 构建、既有 115 项测试及只读备份已完成主要部分，完整回滚/root 核验仍待补齐。该阶段 Task 3—5 未开始，没有安装、停服或 reboot。按 Task 6 的停止条件保存证据；先另行修复 parser、更新候选 SHA 后继续。详见 `../reports/2026-10-24-issue2-hardware-acceptance.md`。
+
+### 继续执行记录（同日）
+
+用户要求“继续工作”，已授权消除本次预检发现的解析阻塞。固定脱敏双屏测试先 RED，再以一处 connector 提取修复 GREEN；本机原始捕获文本在独立诊断副本中也从 RED 变 GREEN。修复提交 `d117a43`，新候选从该提交导出；原 `db73a68` 候选产物仅作为诊断证据，不能安装。新的部署预检仍需完成 root 运行文件 hash、完整回滚和统一切换条件。
+
+### 统一切换记录（同日）
+
+修复候选的五项 release 产物、116 项库测试和二进制检查均通过；锁文件不变。用户在本机终端完成只读 root 预检，确认旧 daemon/Agent 的运行文件与旧安装备份一致、当前 boot 未变。用户确认已保存工作并可重启。随后停止旧 Agent、lifecycle、daemon，原子安装五项新二进制；再次独立核对五项 installed SHA-256 全部等于候选，旧进程全部退出，原有三个 unit 保持 enabled。切换完成时状态为 **WAITING_FOR_REBOOT**。原始 manifest、部署日志和回滚文件位于忽略的本地运行目录。
+
+### 重启后停止条件（同日）
+
+用户正常重启后，新 boot 中 daemon/Agent、protocol 3、双屏和主屏画面均可用，但启动自动 Dock 的 GNOME 命令 `--monitor eDP-2 --mode off` 返回 `No mode off available`。Agent gate 与 daemon state 一致进入 `Degraded/Unknown`；没有重复派发，按 Task 6 停止 Task 5。当前安装仍是 `d117a43`，安全门保持阻断，未在同一 boot 回滚或重启服务。只读证据与脱敏结论见 `../reports/2026-10-24-issue2-hardware-acceptance.md`。
+
+无效参数的生产构造已按 RED→GREEN 测试修正于源码提交 `8ca7fd4`。从该提交独立导出并离线构建了五项匹配候选，候选源码 116 项测试、cargo check 与 UI build 通过，锁文件不变；**此修复未部署**。下一次部署须审核当前 `Unknown` 状态、这五项候选和完整回滚条件，并安排新的受控 boot。不能把本次安全阻断记为 Dock 功能通过。

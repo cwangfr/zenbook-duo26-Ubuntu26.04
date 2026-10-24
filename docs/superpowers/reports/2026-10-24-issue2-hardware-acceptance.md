@@ -1,8 +1,8 @@
-# Issue #2 受控部署执行记录：部署前阻塞
+# Issue #2 受控部署与实机验收记录
 
 日期：2026-10-24。执行方式：Native。用户已要求“开始执行”。
 
-**结论：BLOCKED_BEFORE_DEPLOYMENT。未安装候选二进制、未停止/重启服务、未重启电脑、未执行真实显示写入。实机功能验收尚未开始。**
+**当前结论：BLOCKED_AFTER_BOOT。** 修复后的候选 `d117a43` 已统一安装并完成一次正常重启；启动时的自动 Dock 遇到 GNOME 命令错误，显示安全门进入 `Degraded/Unknown`。主屏正常，但基础功能验收未通过，后续显示操作已停止。下文保留旧候选的部署前阻塞记录。
 
 ## 已完成的准备
 
@@ -47,7 +47,7 @@
 3. 主屏/方向/终端观察已由用户补齐；后续补齐 root 运行 hash 和完整回滚材料，再重新判定预检 GO。
 4. 从统一切换阶段继续；安排一次正常 reboot 后才做计划中的基础实机验收。本次不执行 suspend。
 
-## 验收矩阵
+## 原候选阶段的验收矩阵
 
 | 项目 | 结果 |
 | --- | --- |
@@ -60,3 +60,32 @@
 | 回滚实操 | NOT_NEEDED（系统安装未改变） |
 
 本轮操作裁决：按批准的操作 runbook 使用实际检查和既有回归，不制造真实故障或新增产品代码；预检有缺口时仅继续无系统副作用的离线构建/备份；发现确定 parser 缺陷后停止部署。代价是本轮未完成实机验收，需修复后重新生成候选。
+
+## 解析阻塞的后续处理（同日）
+
+用户要求继续。针对上述捕获的双屏结构，已在主工作区新增脱敏回归 `parses_both_logical_monitors_with_nested_tree_prefixes`，先观察到主屏 enabled/primary 断言失败，再修正逻辑 monitor connector 行中树形前缀的提取，观察到该测试通过。在独立诊断副本中，原始本机 `gdctl show` 捕获文本的回归也从 FAIL 变 PASS。主工作区完整库测试现为 **116 passed, 0 failed**，全部 binary/doc targets、Rust binary check、格式和前端构建通过。修复提交：`d117a43685226ac45f57047fddcd7e94323e42d0`。
+
+旧候选 `db73a68` 仍禁止安装。修复后的固定候选 `d117a43` 从独立源码导出，五项 release 产物离线构建成功；候选源码 **116 passed, 0 failed**，binary/doc targets、cargo check、UI 构建通过，锁文件 hash 未变化。
+
+用户在本机终端完成只读 root 预检：运行中的旧 daemon/Agent 的 executable hash 与已备份的安装文件一致，备份、候选文件及 boot ID 均匹配。用户确认工作已保存、可正常重启。在同一终端执行受控切换后，daemon、Agent、lifecycle 均停止；五个已安装文件的 hash 由脚本和独立只读核对均与新候选一致。原有 system/user units 仍 enabled，当前进程未启动新旧混合 cohort。安装清单和原始日志保存在本地 `local-reports/issue2-deployment/20261024T143414Z/`。
+
+统一切换完成时状态为 **WAITING_FOR_REBOOT**，旧 boot ID 为 `a6d3e086-4eba-4d53-8e5f-2597b20b31a4`。用户随后执行了一次正常重启。
+
+## 重启后阻塞：GNOME 的无效 `--mode off`
+
+新 boot ID `f280c70f-eab4-48ee-9fb2-e17549d9feb8` 与旧值不同。daemon、Agent active 且各只有一个进程；lifecycle unit active/exited。五项 installed hash 再次等于候选，protocol 3 的 daemon 与 Agent 只读请求正常，Agent 已注册到本 boot。两块 eDP 均 connected/enabled，`gdctl show` 与协议布局都显示 eDP-1 为主屏、eDP-2 仍启用。用户确认主屏画面和方向正常，键盘仍盖在下屏，系统显示设置中下屏仍开启。
+
+启动时自动 Dock 的唯一一次 operation 返回 `Unknown`：`Failed to create configuration: No mode off available for eDP-2`。Agent gate 的 revision=1、`active=null`、`receipt=null`，`blocked=Display result could not be verified`；daemon state 的 `displaySafety.degraded=Display result cannot be adopted: Unknown`、`manual_allowed=false`。两次相隔超过两秒的只读快照一致，后续只读复核仍一致，没有继续派发新 operation。安全阻断按设计起效，但 Dock 功能未成功，下屏仍开启。未清理 state、重启服务或重发显示变更；没有继续做物理 Dock、旋转、手动布局或竞争用例。
+
+现场 `/usr/bin/gdctl` 的配置生成器将 `--mode` 的值当作真实显示模式查找；eDP-2 不存在名为 `off` 的模式。GNOME 配置只包含传入的 logical monitors，因此附着模式应只配置 eDP-1，而不为 eDP-2 指定 `--mode off`。源码中原有一个仅用于测试的 primary-only fallback 参数函数，生产 `build_gnome_dock_mode_args` 却仍输出无效参数。针对生产参数构造的回归先 RED，删去附着分支的 eDP-2 参数后 GREEN；完整库测试 **116 passed, 0 failed**、binary/doc targets、cargo check、格式检查通过。修复提交 `8ca7fd4`，**仅在源码中，未部署到本机**。
+
+原始证据留在忽略的本地目录 `local-reports/issue2-deployment/20261024T143414Z/cases/00-postboot/`：两份协议/state 快照、daemon/Agent/kernel journal、`gdctl show`、RED/GREEN 和完整测试日志。`8ca7fd4` 已独立导出并离线构建五项 release 候选；候选源码 116 项库测试、binary/doc targets、cargo check 和 UI build 均通过，锁文件未变化。产物及 hash 清单保存在同一运行目录的 `candidate/next/`，没有安装。当前已安装的仍是 `d117a43` 候选，安全门保持阻断。由于 `Unknown` 的在途结果边界，未在同一 boot 回滚到旧实现，也不靠再次重启绕开阻断；下一轮须审核新候选及回滚条件，再单独安排受控部署、新 boot 和物理验收。主屏-only GNOME 命令的真实硬件效果尚未验证。
+
+| 当前阶段项目 | 结果 |
+| --- | --- |
+| 统一切换、五项 installed hash、新 boot/单实例/protocol 3 | PASS |
+| 主屏与方向用户观察 | PASS |
+| 启动自动 Dock、下屏关闭 | FAIL：`gdctl --mode off` 无效 |
+| Unknown 后停止自动重发与手动写入 | PASS（只读证据） |
+| 3 轮 Dock、旋转、手动布局、轻量竞争 | BLOCKED，未执行 |
+| 完整 #2 suspend/resume | NOT_STARTED（不在本轮范围） |
