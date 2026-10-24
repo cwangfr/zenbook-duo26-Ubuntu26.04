@@ -861,7 +861,7 @@ fn run_command<S: AsRef<str>>(program: &str, args: &[S]) -> Result<(), String> {
     }
 }
 
-fn run_command_output_with_timeout<S: AsRef<str>>(
+pub(crate) fn run_command_output_with_timeout<S: AsRef<str>>(
     program: &str,
     args: &[S],
     timeout_secs: u64,
@@ -873,6 +873,7 @@ fn run_command_output_with_timeout<S: AsRef<str>>(
     let timeout_arg = format!("{timeout_secs}s");
 
     match Command::new("timeout")
+        .arg("--kill-after=1s")
         .arg(&timeout_arg)
         .arg(program)
         .args(&args_vec)
@@ -887,10 +888,6 @@ fn run_command_output_with_timeout<S: AsRef<str>>(
             }
             Ok(output)
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Command::new(program)
-            .args(&args_vec)
-            .output()
-            .map_err(|e| format!("Failed to run {program}: {e}")),
         Err(err) => Err(format!(
             "Failed to run timeout wrapper for {program}: {err}"
         )),

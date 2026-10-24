@@ -169,6 +169,10 @@ pub enum SessionBackend {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionCommand {
+    ApplyDisplayMutation {
+        scope: DisplayScope,
+        mutation: ManualDisplayMutation,
+    },
     BindDisplayScope {
         scope: DisplayScope,
         automatic_blocked: bool,
@@ -246,4 +250,15 @@ mod tests {
         assert_eq!(receipt.operation.target_generation, 1);
         assert_eq!(receipt.report.secondary_enabled, Some(false));
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ManualDisplayMutation {
+    Layout {
+        layout: DisplayLayout,
+    },
+    Orientation {
+        orientation: Orientation,
+        scale: f64,
+    },
 }

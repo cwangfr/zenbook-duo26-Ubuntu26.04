@@ -1,13 +1,16 @@
+use crate::ipc::protocol::ManualDisplayMutation;
+use crate::runtime::display_safety::*;
 use std::env;
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use evdev::{AbsoluteAxisType, Device, EventType};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{interval, timeout, MissedTickBehavior};
@@ -27,9 +30,11 @@ pub async fn run() -> Result<(), String> {
     let listener = bind_session_listener(paths::current_user_session_socket_path().as_path())?;
 
     let backend = wait_for_ready_backend().await?;
-    register_with_daemon(backend).await?;
-    tokio::spawn(async {
-        if let Err(err) = watch_rotation().await {
+    let gate = Arc::new(AgentDisplayGate::new(new_identity()?));
+    register_with_daemon(backend, gate.clone()).await?;
+    let rotation_gate = gate.clone();
+    tokio::spawn(async move {
+        if let Err(err) = watch_rotation(rotation_gate).await {
             log::warn!("session-agent rotation watcher failed: {err}");
             let _ = send_runtime_notification(
                 "Zenbook Duo Runtime Error",
@@ -64,22 +69,26 @@ pub async fn run() -> Result<(), String> {
             .accept()
             .await
             .map_err(|e| format!("Failed to accept session-agent client: {e}"))?;
+        let gate = gate.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_session_command(stream).await {
+            if let Err(err) = handle_session_command(stream, gate).await {
                 log::warn!("session-agent client error: {err}");
             }
         });
     }
 }
 
-async fn register_with_daemon(backend: SessionBackend) -> Result<(), String> {
+async fn register_with_daemon(
+    backend: SessionBackend,
+    gate: Arc<AgentDisplayGate>,
+) -> Result<(), String> {
     let stream = UnixStream::connect(paths::daemon_socket_path())
         .await
         .map_err(|e| format!("Failed to connect to daemon socket: {e}"))?;
     let (reader, mut writer) = stream.into_split();
 
     let request = Envelope::new(DaemonRequest::RegisterSessionAgent {
-        agent_id: crate::runtime::display_safety::new_identity()?,
+        agent_id: gate.snapshot().agent_id,
         session_id: detect_session_id(),
         backend,
         socket_path: paths::current_user_session_socket_path()
@@ -108,7 +117,7 @@ async fn register_with_daemon(backend: SessionBackend) -> Result<(), String> {
         .map_err(|e| format!("Invalid daemon registration response: {e}"))?;
     envelope.validate()?;
     match envelope.payload {
-        DaemonResponse::SessionRegistered { .. } => Ok(()),
+        DaemonResponse::SessionRegistered { scope } => gate.bind_scope(scope),
         DaemonResponse::Error { message } => Err(message),
         other => Err(format!(
             "Unexpected daemon registration response: {other:?}"
@@ -116,7 +125,10 @@ async fn register_with_daemon(backend: SessionBackend) -> Result<(), String> {
     }
 }
 
-async fn handle_session_command(stream: UnixStream) -> Result<(), String> {
+pub(crate) async fn handle_session_command(
+    stream: UnixStream,
+    gate: Arc<AgentDisplayGate>,
+) -> Result<(), String> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -129,12 +141,67 @@ async fn handle_session_command(stream: UnixStream) -> Result<(), String> {
             .map_err(|e| format!("Invalid session command JSON: {e}"))?;
         envelope.validate()?;
         let response = match envelope.payload {
-            SessionCommand::BindDisplayScope { .. }
-            | SessionCommand::ApplyDockOperation { .. }
-            | SessionCommand::GetDisplayExecutionState
-            | SessionCommand::ConsumeDockReceipt { .. } => SessionResponse::Error {
-                message: "Display safety execution unavailable".into(),
+            SessionCommand::BindDisplayScope {
+                scope,
+                automatic_blocked,
+                manual_allowed,
+            } => match gate.bind_context(scope, automatic_blocked, manual_allowed) {
+                Ok(()) => SessionResponse::Ack,
+                Err(message) => SessionResponse::Error { message },
             },
+            SessionCommand::GetDisplayExecutionState => SessionResponse::DisplayExecutionState {
+                snapshot: gate.snapshot(),
+            },
+            SessionCommand::ConsumeDockReceipt {
+                scope,
+                operation_id,
+            } => match gate.consume(&scope, operation_id) {
+                Ok(()) => SessionResponse::Ack,
+                Err(message) => SessionResponse::Error { message },
+            },
+            SessionCommand::ApplyDockOperation { operation } => {
+                let op = operation.clone();
+                match gate.start_write(
+                    DisplayMutationKind::Dock,
+                    operation.scope.clone(),
+                    Some(operation.clone()),
+                    move || super::display_backend::run_dock(op),
+                ) {
+                    Ok(task) => match task.await {
+                        Ok(report) => SessionResponse::DockReceipt {
+                            receipt: DockReceipt { operation, report },
+                        },
+                        Err(e) => SessionResponse::Error {
+                            message: e.to_string(),
+                        },
+                    },
+                    Err(reject) => SessionResponse::DockReceipt {
+                        receipt: DockReceipt {
+                            operation,
+                            report: MutationReport::not_started(format!("{reject:?}")),
+                        },
+                    },
+                }
+            }
+            SessionCommand::ApplyDisplayMutation { scope, mutation } => {
+                let kind = match &mutation {
+                    ManualDisplayMutation::Layout { .. } => DisplayMutationKind::ManualLayout,
+                    _ => DisplayMutationKind::ManualOrientation,
+                };
+                match gate.start_write(kind, scope, None, move || {
+                    super::display_backend::run_manual(mutation, false)
+                }) {
+                    Ok(task) => match task.await {
+                        Ok(report) => SessionResponse::MutationComplete { report },
+                        Err(e) => SessionResponse::Error {
+                            message: e.to_string(),
+                        },
+                    },
+                    Err(reject) => SessionResponse::Error {
+                        message: format!("Display change rejected: {reject:?}"),
+                    },
+                }
+            }
             SessionCommand::GetDisplayLayout => {
                 match crate::hardware::display_config::get_display_layout() {
                     Ok(layout) => SessionResponse::DisplayLayout { layout },
@@ -144,19 +211,9 @@ async fn handle_session_command(stream: UnixStream) -> Result<(), String> {
             SessionCommand::SetDockMode { .. } => SessionResponse::Error {
                 message: "Unscoped automatic dock command rejected".into(),
             },
-            SessionCommand::ApplyDisplayLayout { layout } => {
-                match crate::hardware::display_config::apply_display_layout(&layout) {
-                    Ok(()) => SessionResponse::Ack,
-                    Err(message) => SessionResponse::Error { message },
-                }
-            }
-            SessionCommand::SetOrientation { orientation, scale } => {
-                match crate::hardware::display_config::set_orientation_with_scale(
-                    &orientation,
-                    scale,
-                ) {
-                    Ok(()) => SessionResponse::Ack,
-                    Err(message) => SessionResponse::Error { message },
+            SessionCommand::ApplyDisplayLayout { .. } | SessionCommand::SetOrientation { .. } => {
+                SessionResponse::Error {
+                    message: "Unscoped display mutation rejected".into(),
                 }
             }
             SessionCommand::ShowNotification {
@@ -362,7 +419,7 @@ async fn wait_for_ready_backend() -> Result<SessionBackend, String> {
     }
 }
 
-async fn apply_dock_mode(attached: bool, scale: f64) -> Result<(), String> {
+pub(crate) async fn apply_dock_mode(attached: bool, scale: f64) -> Result<(), String> {
     let backend_hint = detect_backend();
     let backend = if backend_hint == SessionBackend::Unknown {
         detect_ready_backend()
@@ -377,8 +434,12 @@ async fn apply_dock_mode(attached: bool, scale: f64) -> Result<(), String> {
 
     let result = match backend {
         SessionBackend::Gnome => apply_gnome_dock_mode(attached, scale).await,
-        SessionBackend::Kde => apply_kde_dock_mode(attached),
-        SessionBackend::Niri => apply_niri_dock_mode(attached),
+        SessionBackend::Kde => tokio::task::spawn_blocking(move || apply_kde_dock_mode(attached))
+            .await
+            .map_err(|e| e.to_string())?,
+        SessionBackend::Niri => tokio::task::spawn_blocking(move || apply_niri_dock_mode(attached))
+            .await
+            .map_err(|e| e.to_string())?,
         SessionBackend::Unknown => Err("Unsupported session backend for dock mode".into()),
     };
 
@@ -404,34 +465,13 @@ async fn apply_dock_mode(attached: bool, scale: f64) -> Result<(), String> {
 
     result?;
 
-    if let Err(err) = send_dock_mode_notification(attached) {
-        log::warn!("failed to send dock-mode notification: {err}");
-    }
-
     Ok(())
 }
 
 async fn apply_gnome_dock_mode(attached: bool, scale: f64) -> Result<(), String> {
     let args = build_gnome_dock_mode_args(attached, scale);
-    if !attached {
-        run_command_async("gdctl", &args, DOCK_COMMAND_TIMEOUT).await?;
-        return verify_gnome_dock_mode(attached).await;
-    }
-
-    match run_command_async("gdctl", &args, DOCK_COMMAND_TIMEOUT).await {
-        Ok(()) => verify_gnome_dock_mode(attached).await,
-        Err(primary_err) => {
-            // Older mutter/gdctl combinations may reject explicit secondary off.
-            // Keep a compatibility fallback to the historical attached layout call.
-            let fallback_args = build_gnome_attached_fallback_args(scale);
-            log::warn!(
-                "gnome attached dock mode with explicit eDP-2 off failed ({}), trying fallback",
-                primary_err
-            );
-            run_command_async("gdctl", &fallback_args, DOCK_COMMAND_TIMEOUT).await?;
-            verify_gnome_dock_mode(attached).await
-        }
-    }
+    run_command_async("gdctl", &args, DOCK_COMMAND_TIMEOUT).await?;
+    verify_gnome_dock_mode(attached).await
 }
 
 fn build_gnome_dock_mode_args(attached: bool, scale: f64) -> Vec<String> {
@@ -476,6 +516,7 @@ fn build_gnome_dock_mode_args(attached: bool, scale: f64) -> Vec<String> {
     }
 }
 
+#[cfg(test)]
 fn build_gnome_attached_fallback_args(scale: f64) -> Vec<String> {
     let scale_str = format!("{scale:.6}");
     vec![
@@ -659,10 +700,8 @@ fn niri_output_logical_size(name: &str) -> Result<(i64, i64), String> {
 }
 
 fn run_command<S: AsRef<str>>(program: &str, args: &[S]) -> Result<(), String> {
-    let output = Command::new(program)
-        .args(args.iter().map(|arg| arg.as_ref()))
-        .output()
-        .map_err(|e| format!("Failed to run {program}: {e}"))?;
+    let output =
+        crate::hardware::display_config::run_command_output_with_timeout(program, args, 6)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -689,27 +728,47 @@ async fn run_command_capture_async<S: AsRef<str>>(
     timeout_duration: Duration,
 ) -> Result<std::process::Output, String> {
     let mut command = TokioCommand::new(program);
-    command.args(args.iter().map(|arg| arg.as_ref()));
-    command.kill_on_drop(true);
-    let output_future = command
+    command
+        .args(args.iter().map(|arg| arg.as_ref()))
+        .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output();
-
-    match timeout(timeout_duration, output_future).await {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(format!("Failed to run {program}: {e}")),
-        Err(_) => {
-            let args_rendered = args
-                .iter()
-                .map(|arg| arg.as_ref().to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
-            Err(format!(
-                "{program} timed out after {}s (args: {})",
-                timeout_duration.as_secs(),
-                args_rendered
-            ))
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Failed to run {program}: {e}"))?;
+    let mut stdout = child.stdout.take().ok_or("Missing child stdout")?;
+    let mut stderr = child.stderr.take().ok_or("Missing child stderr")?;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let result = timeout(timeout_duration, async {
+        let (status, _, _) = tokio::try_join!(
+            child.wait(),
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err)
+        )?;
+        Ok::<_, std::io::Error>(status)
+    })
+    .await;
+    match result {
+        Ok(Ok(status)) => Ok(std::process::Output {
+            status,
+            stdout: out,
+            stderr: err,
+        }),
+        other => {
+            let _ = child.kill().await;
+            child
+                .wait()
+                .await
+                .map_err(|e| format!("Failed to reap {program}: {e}"))?;
+            match other {
+                Err(_) => Err(format!(
+                    "{program} timed out after {}ms",
+                    timeout_duration.as_millis()
+                )),
+                Ok(Err(e)) => Err(format!("Failed to run {program}: {e}")),
+                _ => unreachable!(),
+            }
         }
     }
 }
@@ -725,8 +784,8 @@ fn ensure_gui_session_env(action: &str) -> Result<(), String> {
 }
 
 fn build_niri_command(args: &[&str]) -> Result<Command, String> {
-    let mut command = Command::new("niri");
-    command.args(args);
+    let mut command = Command::new("timeout");
+    command.args(["--kill-after=1s", "6s", "niri"]).args(args);
     if let Some(socket) = resolve_niri_socket() {
         command.env("NIRI_SOCKET", socket);
     }
@@ -744,20 +803,13 @@ fn run_niri_command(args: &[&str]) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
 fn dock_mode_notification_message(attached: bool) -> &'static str {
     if attached {
         "Keyboard attached: bottom screen disabled"
     } else {
         "Keyboard detached: bottom screen enabled"
     }
-}
-
-fn send_dock_mode_notification(attached: bool) -> Result<(), String> {
-    send_runtime_notification(
-        "Zenbook Duo Control",
-        dock_mode_notification_message(attached),
-        false,
-    )
 }
 
 fn send_runtime_notification(title: &str, message: &str, urgent: bool) -> Result<(), String> {
@@ -1213,7 +1265,7 @@ fn step_brightness(direction: &str) -> Result<(), String> {
     set_display_brightness(next_percent)
 }
 
-async fn watch_rotation() -> Result<(), String> {
+async fn watch_rotation(gate: Arc<AgentDisplayGate>) -> Result<(), String> {
     // Some Intel ISH firmwares expose acceleration samples but never emit the
     // orientation change notifications consumed by monitor-sensor. Read the
     // IIO axes directly so those machines still support automatic rotation.
@@ -1230,21 +1282,29 @@ async fn watch_rotation() -> Result<(), String> {
         if last_orientation.as_ref() == Some(&orientation) {
             continue;
         }
-        last_orientation = Some(orientation.clone());
-
         let settings = crate::commands::settings::load_settings_local();
-        let dual_screen = dual_screen_is_active();
-        if !settings.auto_rotate || !dual_screen {
+        if !settings.auto_rotate {
             continue;
         }
-
-        if let Err(err) = crate::hardware::display_config::set_orientation_with_scale(
-            &orientation,
-            settings.default_scale,
+        let Some(scope) = gate.snapshot().scope else {
+            continue;
+        };
+        let mutation = ManualDisplayMutation::Orientation {
+            orientation: orientation.clone(),
+            scale: settings.default_scale,
+        };
+        if let Ok(task) = gate.start_write(
+            DisplayMutationKind::SensorRotation,
+            scope,
+            None,
+            move || super::display_backend::run_manual(mutation, true),
         ) {
-            log::warn!("failed to apply accelerometer orientation: {err}");
-        } else {
-            log::info!("applied accelerometer orientation: {orientation:?}");
+            if task
+                .await
+                .is_ok_and(|r| matches!(r.status, MutationStatus::Verified))
+            {
+                last_orientation = Some(orientation);
+            }
         }
     }
 }
@@ -1287,6 +1347,7 @@ fn read_accelerometer_orientation() -> Option<Orientation> {
     Some(orientation)
 }
 
+#[allow(dead_code)]
 fn dual_screen_is_active() -> bool {
     // `gdctl` is the authoritative source for the active GNOME logical
     // monitors.  Do not route this guard through the generic layout parser:
@@ -1315,6 +1376,22 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test]
+    async fn timed_out_display_child_is_reaped_before_return() {
+        let pidfile = std::env::temp_dir().join(format!("duo-runner-pid-{}", std::process::id()));
+        let script = format!("echo $$ > {}; exec /bin/sleep 20", pidfile.display());
+        let result =
+            run_command_capture_async("/bin/sh", &["-c", &script], Duration::from_millis(100))
+                .await;
+        assert!(result.is_err());
+        let pid = fs::read_to_string(&pidfile).unwrap();
+        assert!(
+            !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+            "timed-out child still exists when execution reports finished"
+        );
+        fs::remove_file(pidfile).unwrap();
+    }
 
     #[test]
     fn watches_both_known_hotkey_abs_codes() {
