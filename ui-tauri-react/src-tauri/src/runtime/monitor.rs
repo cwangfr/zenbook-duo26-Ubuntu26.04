@@ -11,15 +11,56 @@ use crate::runtime::state::RuntimeState;
 
 const BLUETOOTH_BACKLIGHT_MAX_ATTEMPTS: usize = 12;
 const BLUETOOTH_BACKLIGHT_RETRY_DELAY: Duration = Duration::from_millis(500);
+const KEYBOARD_ATTACHMENT_STABLE_SAMPLES: u8 = 3;
+
+struct KeyboardAttachmentDebounce {
+    published: bool,
+    candidate: Option<(bool, u8)>,
+}
+
+impl KeyboardAttachmentDebounce {
+    fn new(published: bool) -> Self {
+        Self {
+            published,
+            candidate: None,
+        }
+    }
+
+    fn observe(&mut self, sample: bool) -> Option<bool> {
+        if sample == self.published {
+            self.candidate = None;
+            return None;
+        }
+
+        let count = match self.candidate {
+            Some((candidate, count)) if candidate == sample => count.saturating_add(1),
+            _ => 1,
+        };
+        self.candidate = Some((sample, count));
+
+        if count < KEYBOARD_ATTACHMENT_STABLE_SAMPLES {
+            return None;
+        }
+
+        self.published = sample;
+        self.candidate = None;
+        Some(sample)
+    }
+}
 
 pub fn start(state: Arc<RwLock<RuntimeState>>) {
     let keyboard_state = state.clone();
     tokio::spawn(async move {
+        let mut debounce =
+            KeyboardAttachmentDebounce::new(keyboard_state.read().await.status.keyboard_attached);
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let attached = crate::runtime::probe::keyboard_attached();
+            let Some(attached) = debounce.observe(crate::runtime::probe::keyboard_attached())
+            else {
+                continue;
+            };
             match publish_keyboard_state(&keyboard_state, attached).await {
                 Ok(actions) if !actions.is_empty() => {
                     let state = keyboard_state.clone();
@@ -562,7 +603,10 @@ fn orientation_label(orientation: &crate::models::Orientation) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_quiet_action, should_skip_detached_secondary_recovery, AutoQuietAction};
+    use super::{
+        auto_quiet_action, should_skip_detached_secondary_recovery, AutoQuietAction,
+        KeyboardAttachmentDebounce,
+    };
     use crate::models::{PerformanceMode, PowerLimits};
     use crate::runtime::state::RuntimeState;
 
@@ -606,6 +650,17 @@ mod tests {
     #[test]
     fn enabled_panel_never_needs_detached_recovery_protection() {
         assert!(!should_skip_detached_secondary_recovery(false, true, false));
+    }
+
+    #[test]
+    fn keyboard_attachment_debounce_ignores_usb_enumeration_bounce() {
+        let mut debounce = KeyboardAttachmentDebounce::new(true);
+
+        assert_eq!(debounce.observe(false), None);
+        assert_eq!(debounce.observe(true), None);
+        assert_eq!(debounce.observe(false), None);
+        assert_eq!(debounce.observe(false), None);
+        assert_eq!(debounce.observe(false), Some(false));
     }
 }
 
