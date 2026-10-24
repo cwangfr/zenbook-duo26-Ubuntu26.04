@@ -156,6 +156,13 @@ fn initialize_state() -> RuntimeState {
             ));
         }
     }
+    match (
+        crate::runtime::state::current_boot_id(),
+        crate::runtime::display_safety::new_identity(),
+    ) {
+        (Some(boot), Ok(id)) => state.display_safety.begin_daemon(&boot, id),
+        _ => state.storage_fault = Some("Cannot establish display safety identity".into()),
+    }
     state.session_agent = Default::default();
     state.validate_secondary_panel_ownership_for_current_boot();
     state.touch();
@@ -481,12 +488,24 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<RuntimeState>>) -> 
                 message: "Service restart not yet owned by rust-daemon".into(),
             },
             DaemonRequest::RegisterSessionAgent {
+                agent_id,
                 session_id,
                 backend,
                 socket_path,
             } => {
                 match handle_session_registration(&state, session_id, backend, socket_path).await {
-                    Ok(()) => DaemonResponse::Ack,
+                    Ok(()) => {
+                        let mut g = state.write().await;
+                        let scope = crate::runtime::display_safety::DisplayScope {
+                            boot_id: g.display_safety.boot_id.clone(),
+                            daemon_id: g.display_safety.daemon_id.clone(),
+                            agent_id,
+                            registration_generation: SESSION_GENERATION.load(Ordering::Relaxed),
+                            lifecycle_epoch: g.display_safety.lifecycle_epoch,
+                        };
+                        g.session_agent.scope = Some(scope.clone());
+                        DaemonResponse::SessionRegistered { scope }
+                    }
                     Err(message) => DaemonResponse::Error { message },
                 }
             }
@@ -859,9 +878,7 @@ pub(crate) async fn forward_session_command(
     match request_session(state.clone(), command, true).await? {
         SessionResponse::Ack => Ok(()),
         SessionResponse::Error { message } => Err(message),
-        SessionResponse::DisplayLayout { .. } => {
-            Err("Unexpected display-layout response for command request".into())
-        }
+        _ => Err("Unexpected response for command request".into()),
     }
 }
 
@@ -1075,6 +1092,7 @@ async fn request_session(
     let envelope: Envelope<SessionResponse> =
         serde_json::from_str(&reply).map_err(|e| format!("Invalid session response JSON: {e}"))?;
 
+    envelope.validate()?;
     SESSION_TIMEOUT_STREAK.store(0, Ordering::Relaxed);
     Ok(envelope.payload)
 }
@@ -1225,9 +1243,7 @@ async fn send_runtime_notification_via_session(
     {
         SessionResponse::Ack => Ok(()),
         SessionResponse::Error { message } => Err(message),
-        SessionResponse::DisplayLayout { .. } => {
-            Err("Unexpected display-layout response for notification request".into())
-        }
+        _ => Err("Unexpected display-layout response for notification request".into()),
     }
 }
 

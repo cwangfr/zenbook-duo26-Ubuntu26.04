@@ -1,3 +1,6 @@
+use crate::runtime::display_safety::{
+    DisplayExecutionSnapshot, DisplayScope, DockOperation, DockReceipt, MutationReport,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::usb_media_remap::UsbMediaRemapStatus;
@@ -6,7 +9,7 @@ use crate::models::{
     PerformanceMode,
 };
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,6 +19,16 @@ pub struct Envelope<T> {
 }
 
 impl<T> Envelope<T> {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.protocol_version == PROTOCOL_VERSION {
+            Ok(())
+        } else {
+            Err(format!(
+                "Protocol mismatch: expected {PROTOCOL_VERSION}, got {}",
+                self.protocol_version
+            ))
+        }
+    }
     pub fn new(payload: T) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
@@ -62,6 +75,7 @@ pub enum DaemonRequest {
     UsbMediaRemapTogglePause,
     RestartService,
     RegisterSessionAgent {
+        agent_id: String,
         session_id: String,
         backend: SessionBackend,
         socket_path: String,
@@ -83,6 +97,9 @@ pub enum DaemonRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonResponse {
+    SessionRegistered {
+        scope: DisplayScope,
+    },
     Pong,
     Ack,
     Status {
@@ -152,6 +169,19 @@ pub enum SessionBackend {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionCommand {
+    BindDisplayScope {
+        scope: DisplayScope,
+        automatic_blocked: bool,
+        manual_allowed: bool,
+    },
+    ApplyDockOperation {
+        operation: DockOperation,
+    },
+    GetDisplayExecutionState,
+    ConsumeDockReceipt {
+        scope: DisplayScope,
+        operation_id: u64,
+    },
     GetDisplayLayout,
     SetDockMode {
         attached: bool,
@@ -175,7 +205,45 @@ pub enum SessionCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionResponse {
+    DockReceipt { receipt: DockReceipt },
+    DisplayExecutionState { snapshot: DisplayExecutionSnapshot },
+    MutationComplete { report: MutationReport },
     Ack,
     DisplayLayout { layout: DisplayLayout },
     Error { message: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn old_wire_version_is_rejected() {
+        let old = Envelope {
+            protocol_version: 2,
+            payload: DaemonRequest::Ping,
+        };
+        assert!(old.validate().is_err());
+    }
+    #[test]
+    fn scoped_receipt_roundtrip_keeps_identity_and_evidence() {
+        use crate::runtime::display_safety::{
+            tests::{operation, report},
+            DockReceipt,
+        };
+        let value = SessionResponse::DockReceipt {
+            receipt: DockReceipt {
+                operation: operation(),
+                report: report(),
+            },
+        };
+        let raw = serde_json::to_string(&Envelope::new(value)).unwrap();
+        let parsed: Envelope<SessionResponse> = serde_json::from_str(&raw).unwrap();
+        parsed.validate().unwrap();
+        let SessionResponse::DockReceipt { receipt } = parsed.payload else {
+            panic!("wrong response")
+        };
+        assert_eq!(receipt.operation.scope.agent_id, "agent");
+        assert_eq!(receipt.operation.target_generation, 1);
+        assert_eq!(receipt.report.secondary_enabled, Some(false));
+    }
 }

@@ -15,6 +15,8 @@ pub struct RuntimeState {
     pub storage: Arc<RuntimeStore>,
     #[serde(skip)]
     pub storage_fault: Option<String>,
+    #[serde(default)]
+    pub display_safety: crate::runtime::display_safety::DisplaySafetyState,
     pub status: DuoStatus,
     pub settings: DuoSettings,
     pub session_agent: SessionAgentState,
@@ -44,6 +46,7 @@ impl Default for RuntimeState {
         Self {
             storage: default_store(),
             storage_fault: None,
+            display_safety: Default::default(),
             status: DuoStatus::default(),
             settings: DuoSettings::default(),
             session_agent: SessionAgentState::default(),
@@ -61,6 +64,8 @@ impl Default for RuntimeState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionAgentState {
+    #[serde(default)]
+    pub scope: Option<crate::runtime::display_safety::DisplayScope>,
     pub connected: bool,
     pub session_id: Option<String>,
     pub backend: Option<SessionBackend>,

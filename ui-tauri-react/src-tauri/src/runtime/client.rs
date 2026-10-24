@@ -35,5 +35,6 @@ pub fn request(request: DaemonRequest) -> Result<DaemonResponse, String> {
 
     let envelope: Envelope<DaemonResponse> = serde_json::from_str(reply.trim_end())
         .map_err(|e| format!("Invalid daemon response JSON: {e}"))?;
+    envelope.validate()?;
     Ok(envelope.payload)
 }

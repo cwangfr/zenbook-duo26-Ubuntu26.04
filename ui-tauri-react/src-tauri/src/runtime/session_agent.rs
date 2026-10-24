@@ -79,6 +79,7 @@ async fn register_with_daemon(backend: SessionBackend) -> Result<(), String> {
     let (reader, mut writer) = stream.into_split();
 
     let request = Envelope::new(DaemonRequest::RegisterSessionAgent {
+        agent_id: crate::runtime::display_safety::new_identity()?,
         session_id: detect_session_id(),
         backend,
         socket_path: paths::current_user_session_socket_path()
@@ -105,8 +106,9 @@ async fn register_with_daemon(backend: SessionBackend) -> Result<(), String> {
 
     let envelope: Envelope<DaemonResponse> = serde_json::from_str(&reply)
         .map_err(|e| format!("Invalid daemon registration response: {e}"))?;
+    envelope.validate()?;
     match envelope.payload {
-        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::SessionRegistered { .. } => Ok(()),
         DaemonResponse::Error { message } => Err(message),
         other => Err(format!(
             "Unexpected daemon registration response: {other:?}"
@@ -125,19 +127,23 @@ async fn handle_session_command(stream: UnixStream) -> Result<(), String> {
     {
         let envelope: Envelope<SessionCommand> = serde_json::from_str(&line)
             .map_err(|e| format!("Invalid session command JSON: {e}"))?;
+        envelope.validate()?;
         let response = match envelope.payload {
+            SessionCommand::BindDisplayScope { .. }
+            | SessionCommand::ApplyDockOperation { .. }
+            | SessionCommand::GetDisplayExecutionState
+            | SessionCommand::ConsumeDockReceipt { .. } => SessionResponse::Error {
+                message: "Display safety execution unavailable".into(),
+            },
             SessionCommand::GetDisplayLayout => {
                 match crate::hardware::display_config::get_display_layout() {
                     Ok(layout) => SessionResponse::DisplayLayout { layout },
                     Err(message) => SessionResponse::Error { message },
                 }
             }
-            SessionCommand::SetDockMode { attached, scale } => {
-                match apply_dock_mode(attached, scale).await {
-                    Ok(()) => SessionResponse::Ack,
-                    Err(message) => SessionResponse::Error { message },
-                }
-            }
+            SessionCommand::SetDockMode { .. } => SessionResponse::Error {
+                message: "Unscoped automatic dock command rejected".into(),
+            },
             SessionCommand::ApplyDisplayLayout { layout } => {
                 match crate::hardware::display_config::apply_display_layout(&layout) {
                     Ok(()) => SessionResponse::Ack,
