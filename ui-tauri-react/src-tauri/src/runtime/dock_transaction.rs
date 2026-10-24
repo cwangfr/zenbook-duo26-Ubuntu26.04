@@ -1573,6 +1573,31 @@ mod tests {
         assert!(g.display_safety.degraded.is_none());
     }
     #[tokio::test]
+    async fn layout_probe_inflight_across_suspend_does_not_disconnect() {
+        let f = fixture("enabled", None).await;
+        super::super::daemon::reset_resume_grace_for_test().await;
+        assert!(!super::super::daemon::resume_grace_active().await);
+        std::fs::write(f.root.join("hold-layout"), "").unwrap();
+        let state = f.state.clone();
+        let probe = tokio::spawn(async move {
+            super::super::daemon::request_session(state, SessionCommand::GetDisplayLayout, true)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        f.state.write().await.display_safety.suspended = true;
+        let err = timeout(Duration::from_secs(5), probe)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        std::fs::remove_file(f.root.join("hold-layout")).unwrap();
+        assert!(err.contains("Timed out waiting for session response"));
+        let g = f.state.read().await;
+        assert!(g.session_agent.connected);
+        assert!(g.display_safety.suspended);
+        assert!(g.display_safety.degraded.is_none());
+    }
+    #[tokio::test]
     async fn same_agent_refresh_keeps_generation_and_does_not_clear_degraded() {
         let f = fixture("enabled", None).await;
         let (agent_id, socket, generation) = {

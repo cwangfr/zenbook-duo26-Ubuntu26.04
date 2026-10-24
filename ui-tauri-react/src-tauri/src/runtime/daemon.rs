@@ -237,8 +237,19 @@ pub(crate) async fn resume_grace_active() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
+pub(crate) async fn reset_resume_grace_for_test() {
+    *resume_grace_cell().lock().await = None;
+}
+
 async fn display_probe_grace_active() -> bool {
     startup_grace_active_for_display_probe().await || resume_grace_active().await
+}
+
+async fn suppress_layout_probe_disconnect(state: &Arc<RwLock<RuntimeState>>) -> bool {
+    // Sampled at timeout, not at request start. A probe already in flight when
+    // suspend begins has neither grace nor the suspended flag yet.
+    display_probe_grace_active().await || state.read().await.display_safety.suspended
 }
 
 pub(crate) async fn run_startup_replay_once(state: Arc<RwLock<RuntimeState>>) {
@@ -796,8 +807,6 @@ pub(crate) async fn request_session(
     let is_display_probe_command = matches!(command, SessionCommand::GetDisplayLayout);
     let timeout_for_command = session_timeout_for_command(&command);
     let disconnect_on_timeout = disconnect_on_failure && should_disconnect_on_timeout(&command);
-    let relax_disconnect_for_probe =
-        is_display_probe_command && display_probe_grace_active().await;
 
     let socket_path = {
         let guard = state.read().await;
@@ -821,13 +830,14 @@ pub(crate) async fn request_session(
             return Err(format!("Failed to connect to session agent: {e}"));
         }
         Err(_) => {
-            if disconnect_on_timeout && !relax_disconnect_for_probe {
+            let suppress =
+                is_display_probe_command && suppress_layout_probe_disconnect(&state).await;
+            if disconnect_on_timeout && !suppress {
                 mark_session_agent_disconnected(&state, "Timed out connecting to session agent")
                     .await;
-            } else if disconnect_on_timeout && relax_disconnect_for_probe {
+            } else if disconnect_on_timeout && suppress {
                 let _ = logger::append_line(
-                    "rust-daemon: display probe grace active, suppressing disconnect on connect-timeout"
-                        .to_string(),
+                    "rust-daemon: layout probe timeout kept session agent connected".to_string(),
                 );
             }
             return Err("Timed out connecting to session agent".to_string());
@@ -890,14 +900,21 @@ pub(crate) async fn request_session(
                         SESSION_TIMEOUT_STREAK.store(0, Ordering::Relaxed);
                     }
                 }
-            } else if disconnect_on_timeout && !relax_disconnect_for_probe {
-                mark_session_agent_disconnected(&state, "Timed out waiting for session response")
+            } else {
+                let suppress =
+                    is_display_probe_command && suppress_layout_probe_disconnect(&state).await;
+                if disconnect_on_timeout && !suppress {
+                    mark_session_agent_disconnected(
+                        &state,
+                        "Timed out waiting for session response",
+                    )
                     .await;
-            } else if disconnect_on_timeout && relax_disconnect_for_probe {
-                let _ = logger::append_line(
-                    "rust-daemon: display probe grace active, suppressing disconnect on response-timeout"
-                        .to_string(),
-                );
+                } else if disconnect_on_timeout && suppress {
+                    let _ = logger::append_line(
+                        "rust-daemon: layout probe timeout kept session agent connected"
+                            .to_string(),
+                    );
+                }
             }
             return Err("Timed out waiting for session response".to_string());
         }
