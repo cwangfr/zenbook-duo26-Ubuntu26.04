@@ -314,7 +314,13 @@ fn parse_gdctl_output(output: &str) -> Result<DisplayLayout, String> {
             // Monitor list item under this logical monitor.
             // Example: "└──eDP-1 (Built-in display)"
             if line.contains('(') {
-                let token = line.split_whitespace().next().unwrap_or("");
+                let token = line
+                    .rsplit('─')
+                    .next()
+                    .unwrap_or(line)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
                 let connector = token
                     .trim()
                     .trim_start_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '-'));
@@ -1249,6 +1255,54 @@ Logical monitors:
         assert_eq!(display.available_modes.len(), 2);
         assert_eq!(display.available_modes[1].mode_id, "2880x1800@60");
         assert_eq!(display.refresh_policy, RefreshPolicy::Fixed);
+    }
+
+    #[test]
+    fn parses_both_logical_monitors_with_nested_tree_prefixes() {
+        let output = r#"Monitors:
+├──Monitor eDP-1 (Built-in display)
+│  ├──Current mode
+│  │   └──2880x1800@144.000
+└──Monitor eDP-2 (Built-in display)
+   ├──Current mode
+   │   └──2880x1800@144.000
+Logical monitors:
+├──Logical monitor #1
+│  ├──Position: (0, 0)
+│  ├──Scale: 1.6666666269302368
+│  ├──Transform: 180
+│  ├──Primary: yes
+│  └──Monitors: (1)
+│      └──eDP-1 (Built-in display)
+└──Logical monitor #2
+   ├──Position: (0, 1080)
+   ├──Scale: 1.6666666269302368
+   ├──Transform: normal
+   ├──Primary: no
+   └──Monitors: (1)
+       └──eDP-2 (Built-in display)
+"#;
+        let layout = parse_gdctl_output(output).unwrap();
+        let primary = layout
+            .displays
+            .iter()
+            .find(|d| d.connector == "eDP-1")
+            .unwrap();
+        let secondary = layout
+            .displays
+            .iter()
+            .find(|d| d.connector == "eDP-2")
+            .unwrap();
+
+        assert!(primary.enabled && primary.primary);
+        assert_eq!((primary.x, primary.y, primary.transform), (0, 0, 180));
+        assert!(secondary.enabled && !secondary.primary);
+        assert_eq!(
+            (secondary.x, secondary.y, secondary.transform),
+            (0, 1080, 0)
+        );
+        assert!((primary.scale - 1.6666666269302368).abs() < f64::EPSILON);
+        assert!((secondary.scale - 1.6666666269302368).abs() < f64::EPSILON);
     }
 
     #[test]
