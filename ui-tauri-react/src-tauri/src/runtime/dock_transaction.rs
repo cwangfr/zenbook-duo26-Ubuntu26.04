@@ -61,8 +61,11 @@ pub(crate) async fn bind_current_context(
         let g = state.read().await;
         (
             scope_of(&g)?,
-            g.display_safety.degraded.is_some(),
-            g.display_safety.manual_allowed && g.display_safety.pending.is_none(),
+            g.display_safety.degraded.is_some() || g.display_safety.suspended,
+            g.display_safety.manual_allowed
+                && g.display_safety.pending.is_none()
+                && !g.display_safety.manual_pending
+                && !g.display_safety.suspended,
         )
     };
     match rpc(
@@ -128,6 +131,7 @@ pub(crate) async fn degrade(state: &Arc<RwLock<RuntimeState>>, reason: impl Into
         let _ = save(&mut g);
     }
     let _ = push_degraded_policy(state).await;
+    super::daemon::notify_runtime_error(state,"Zenbook Duo Display Protection","Display result is unknown. Automatic display changes are paused for this boot; see the runtime journals before recovery.").await;
 }
 pub async fn submit_dock_target(
     state: &Arc<RwLock<RuntimeState>>,
@@ -156,7 +160,10 @@ pub async fn submit_dock_target(
         source,
     });
     save(&mut g)?;
-    if !g.display_safety.worker_running && g.display_safety.degraded.is_none() {
+    if !g.display_safety.worker_running
+        && g.display_safety.degraded.is_none()
+        && !g.display_safety.suspended
+    {
         g.display_safety.worker_running = true;
         let state = state.clone();
         tokio::spawn(async move {
@@ -216,6 +223,9 @@ async fn drain_one(state: &Arc<RwLock<RuntimeState>>, target: &DockTarget) -> Re
         let g = state.read().await;
         if let Some(reason) = &g.display_safety.degraded {
             return Err(reason.clone());
+        }
+        if g.display_safety.suspended {
+            return Err("Display session is suspending".into());
         }
     }
     let scope = bind_current_context(state).await?;
@@ -316,6 +326,7 @@ async fn finish_receipt(
     mode: ReconcileMode,
 ) -> Result<(), String> {
     let mut verified = false;
+    let mut completed_current = false;
     {
         let mut g = state.write().await;
         if g.display_safety.pending.as_ref() != Some(&receipt.operation) {
@@ -350,6 +361,7 @@ async fn finish_receipt(
                     matches!(report.before, PanelObservation::Enabled),
                 );
                 if decision == CommitDecision::EvidenceAndTargetComplete {
+                    completed_current = true;
                     g.display_safety.target = None;
                 }
             } else {
@@ -378,6 +390,33 @@ async fn finish_receipt(
     }
     consume_saved_receipt(state).await?;
     let _ = bind_current_context(state).await;
+    if completed_current {
+        let still_current = {
+            let g = state.read().await;
+            g.display_safety.target.is_none()
+                && scope_of(&g).is_ok_and(|scope| scope == receipt.operation.scope)
+        };
+        if still_current {
+            let state = state.clone();
+            let attached = receipt.operation.attached;
+            tokio::spawn(async move {
+                let _ = rpc(
+                    &state,
+                    SessionCommand::ShowNotification {
+                        title: "Zenbook Duo Control".into(),
+                        message: if attached {
+                            "Keyboard attached: bottom screen disabled".into()
+                        } else {
+                            "Keyboard detached: bottom screen enabled".into()
+                        },
+                        urgent: false,
+                    },
+                    QUERY_BUDGET,
+                )
+                .await;
+            });
+        }
+    }
     if mode == ReconcileMode::Active && state.read().await.display_safety.degraded.is_some() {
         Err("Automatic display changes remain degraded".into())
     } else {
@@ -462,7 +501,8 @@ pub(crate) async fn apply_manual(
     let _execution = executor.lock().await;
     {
         let g = state.read().await;
-        if g.display_safety.pending.is_some()
+        if g.display_safety.suspended
+            || g.display_safety.pending.is_some()
             || g.display_safety.manual_pending
             || !g.display_safety.manual_allowed
         {
@@ -631,6 +671,7 @@ mod tests {
                             Ok(()) => SessionResponse::Ack,
                             Err(message) => SessionResponse::Error { message },
                         },
+                        SessionCommand::ShowNotification { .. } => SessionResponse::Ack,
                         SessionCommand::GetDisplayExecutionState => {
                             SessionResponse::DisplayExecutionState {
                                 snapshot: g.snapshot(),
@@ -1061,5 +1102,94 @@ mod tests {
         .await
         .unwrap();
         assert!(!f.state.read().await.secondary_panel_disabled_by_runtime);
+    }
+    #[tokio::test]
+    async fn safety_lifecycle_publishes_target_even_when_backlight_fails() {
+        let f = fixture("enabled", None).await;
+        let outcome = super::super::daemon::handle_lifecycle_with(
+            &f.state,
+            LifecyclePhase::Post,
+            true,
+            |_| Err("fake HID failure".into()),
+        )
+        .await;
+        assert!(outcome.is_err());
+        idle(&f).await;
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        assert!(f.state.read().await.secondary_panel_disabled_by_runtime);
+    }
+    #[tokio::test]
+    async fn safety_lifecycle_invalidates_inflight_but_preserves_previously_committed_ownership() {
+        let n = Arc::new(tokio::sync::Notify::new());
+        let f = fixture("enabled", Some(n.clone())).await;
+        submit_dock_target(&f.state, true, 1.67, DockSource::Monitor)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while f.gate.snapshot().active.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        super::super::daemon::advance_display_epoch(&f.state, LifecyclePhase::Pre)
+            .await
+            .unwrap();
+        super::super::daemon::advance_display_epoch(&f.state, LifecyclePhase::Post)
+            .await
+            .unwrap();
+        n.notify_one();
+        idle(&f).await;
+        assert!(!f.state.read().await.secondary_panel_disabled_by_runtime);
+        assert!(f.state.read().await.display_safety.degraded.is_some());
+        assert!(f.gate.snapshot().automatic_blocked);
+        let f = fixture("disabled", None).await;
+        f.state.write().await.secondary_panel_disabled_by_runtime = true;
+        super::super::daemon::advance_display_epoch(&f.state, LifecyclePhase::Pre)
+            .await
+            .unwrap();
+        assert!(f.state.read().await.secondary_panel_disabled_by_runtime);
+    }
+    #[tokio::test]
+    async fn safety_fast_keyboard_publication_cannot_be_undone_by_slow_probe() {
+        let f = fixture("enabled", None).await;
+        let mut old = f.state.read().await.status.clone();
+        old.keyboard_attached = false;
+        let side = super::super::monitor::publish_keyboard_state(&f.state, true)
+            .await
+            .unwrap();
+        assert!(side
+            .iter()
+            .any(|a| matches!(a, super::super::policy::PolicyAction::SetBacklight(_))));
+        // The caller has not run its slow HID/radio side work yet.
+        assert!(f.state.read().await.display_safety.target.is_some());
+        super::super::monitor::apply_polled_status(&f.state, old)
+            .await
+            .unwrap();
+        assert!(f.state.read().await.status.keyboard_attached);
+        idle(&f).await;
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn safety_crash_after_receipt_consumption_can_finish_durable_obligation() {
+        let f = fixture("enabled", None).await;
+        completed_pending(&f).await;
+        let receipt = f.gate.snapshot().receipt.unwrap();
+        {
+            let mut g = f.state.write().await;
+            g.display_safety.receipt_to_consume = Some(receipt.clone());
+            g.touch();
+            g.save().unwrap();
+        }
+        f.gate
+            .consume(&receipt.operation.scope, receipt.operation.operation_id)
+            .unwrap();
+        reconcile_pending_dock(&f.state, ReconcileMode::Active)
+            .await
+            .unwrap();
+        let g = f.state.read().await;
+        assert!(g.display_safety.pending.is_none());
+        assert!(g.display_safety.receipt_to_consume.is_none());
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
     }
 }

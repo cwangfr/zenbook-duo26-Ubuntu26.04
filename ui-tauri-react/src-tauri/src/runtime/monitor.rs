@@ -13,60 +13,50 @@ const BLUETOOTH_BACKLIGHT_MAX_ATTEMPTS: usize = 12;
 const BLUETOOTH_BACKLIGHT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 pub fn start(state: Arc<RwLock<RuntimeState>>) {
+    let keyboard_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            interval.tick().await;
-
-            let mut next_status = crate::runtime::probe::current_status();
-            let session_connected = {
-                let guard = state.read().await;
-                guard.session_agent.connected
-            };
-            next_status.service_active = session_connected;
-
-            if let Some(layout) =
-                crate::runtime::daemon::session_display_layout(state.clone()).await
-            {
-                crate::runtime::probe::apply_layout_to_status(&mut next_status, Some(&layout));
-                next_status.service_active = true;
-            }
-
-            let mut guard = state.write().await;
-            let previous = guard.status.clone();
-
-            if previous != next_status {
-                let updated = next_status.clone();
-                let _ = logger::append_line(format!(
-                    "rust-daemon: status transition attached={} monitors={} wifi={} bluetooth={} connection={}",
-                    updated.keyboard_attached,
-                    updated.monitor_count,
-                    updated.wifi_enabled,
-                    updated.bluetooth_enabled,
-                    connection_label(&updated.connection_type),
-                ));
-                guard.status = next_status;
-                let actions =
-                    crate::runtime::policy::apply_transition_policy(&mut guard, &previous);
-                let _ = logger::append_line(format!(
-                    "rust-daemon: transition radios prev(wifi={},bt={}) current(wifi={},bt={}) actions=[{}]",
-                    previous.wifi_enabled,
-                    previous.bluetooth_enabled,
-                    updated.wifi_enabled,
-                    updated.bluetooth_enabled,
-                    summarize_actions(&actions)
-                ));
-                push_status_events(&mut guard, &previous, &updated);
-                guard.touch();
-                if let Err(err) = guard.save() {
-                    log::warn!("failed to save monitored runtime state: {err}");
+            tick.tick().await;
+            let attached = crate::runtime::probe::keyboard_attached();
+            match publish_keyboard_state(&keyboard_state, attached).await {
+                Ok(actions) if !actions.is_empty() => {
+                    let state = keyboard_state.clone();
+                    tokio::spawn(async move {
+                        apply_policy_actions(state, actions).await;
+                    });
                 }
-                drop(guard);
-                apply_policy_actions(state.clone(), actions).await;
-            } else {
-                drop(guard);
+                Err(reason) => log::warn!("Keyboard publication blocked: {reason}"),
+                _ => {}
             }
-
+        }
+    });
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let Ok(mut status) =
+                tokio::task::spawn_blocking(crate::runtime::probe::current_status).await
+            else {
+                continue;
+            };
+            if !state.read().await.display_safety.suspended {
+                if let Some(layout) =
+                    crate::runtime::daemon::session_display_layout(state.clone()).await
+                {
+                    crate::runtime::probe::apply_layout_to_status(&mut status, Some(&layout));
+                }
+            }
+            if let Ok(actions) = apply_polled_status(&state, status).await {
+                if !actions.is_empty() {
+                    let s = state.clone();
+                    tokio::spawn(async move {
+                        apply_policy_actions(s, actions).await;
+                    });
+                }
+            }
             reconcile_usb_media_remap(state.clone()).await;
             reconcile_auto_quiet_on_battery(state.clone()).await;
         }
@@ -313,7 +303,12 @@ async fn apply_policy_actions(state: Arc<RwLock<RuntimeState>>, actions: Vec<Pol
     for action in actions {
         match action {
             PolicyAction::EnsureBluetoothEnabled => {
-                if let Err(err) = crate::runtime::policy::ensure_bluetooth_enabled() {
+                if let Err(err) =
+                    tokio::task::spawn_blocking(crate::runtime::policy::ensure_bluetooth_enabled)
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r)
+                {
                     log::warn!("failed to ensure Bluetooth is enabled: {err}");
                     crate::runtime::daemon::notify_runtime_error(
                         &state,
@@ -330,7 +325,12 @@ async fn apply_policy_actions(state: Arc<RwLock<RuntimeState>>, actions: Vec<Pol
                 }
             }
             PolicyAction::SetBacklight(level) => {
-                if let Err(err) = crate::hardware::hid::set_backlight(level) {
+                if let Err(err) =
+                    tokio::task::spawn_blocking(move || crate::hardware::hid::set_backlight(level))
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r)
+                {
                     log::warn!("failed to set backlight policy action: {err}");
                     crate::runtime::daemon::notify_runtime_error(
                         &state,
@@ -607,4 +607,73 @@ mod tests {
     fn enabled_panel_never_needs_detached_recovery_protection() {
         assert!(!should_skip_detached_secondary_recovery(false, true, false));
     }
+}
+
+pub(crate) async fn publish_keyboard_state(
+    state: &Arc<RwLock<RuntimeState>>,
+    attached: bool,
+) -> Result<Vec<PolicyAction>, String> {
+    let actions = {
+        let mut g = state.write().await;
+        if g.status.keyboard_attached == attached {
+            return Ok(vec![]);
+        }
+        let previous = g.status.clone();
+        g.status.keyboard_attached = attached;
+        let actions = crate::runtime::policy::apply_transition_policy(&mut g, &previous);
+        let updated = g.status.clone();
+        push_status_events(&mut g, &previous, &updated);
+        g.touch();
+        if let Err(reason) = g.save() {
+            g.storage_fault = Some(reason.clone());
+            drop(g);
+            super::dock_transaction::degrade(state, reason.clone()).await;
+            return Err(reason);
+        }
+        actions
+    };
+    log::info!(
+        "keyboard attached={attached} actions=[{}]",
+        summarize_actions(&actions)
+    );
+    let mut side = Vec::new();
+    for action in actions {
+        match action {
+            PolicyAction::SetDockMode { attached, scale } => {
+                super::dock_transaction::submit_dock_target(
+                    state,
+                    attached,
+                    scale,
+                    super::display_safety::DockSource::Monitor,
+                )
+                .await?;
+            }
+            other => side.push(other),
+        }
+    }
+    Ok(side)
+}
+pub(crate) async fn apply_polled_status(
+    state: &Arc<RwLock<RuntimeState>>,
+    mut status: crate::models::DuoStatus,
+) -> Result<Vec<PolicyAction>, String> {
+    let mut g = state.write().await;
+    status.keyboard_attached = g.status.keyboard_attached;
+    status.service_active = g.session_agent.connected;
+    let previous = g.status.clone();
+    if previous == status {
+        return Ok(vec![]);
+    }
+    g.status = status;
+    let actions = crate::runtime::policy::apply_transition_policy(&mut g, &previous);
+    let updated = g.status.clone();
+    push_status_events(&mut g, &previous, &updated);
+    g.touch();
+    if let Err(reason) = g.save() {
+        g.storage_fault = Some(reason.clone());
+        drop(g);
+        super::dock_transaction::degrade(state, reason.clone()).await;
+        return Err(reason);
+    }
+    Ok(actions)
 }

@@ -143,7 +143,15 @@ pub(crate) async fn handle_session_command(
     {
         let envelope: Envelope<SessionCommand> = serde_json::from_str(&line)
             .map_err(|e| format!("Invalid session command JSON: {e}"))?;
-        envelope.validate()?;
+        if let Err(message) = envelope.validate() {
+            let error = serde_json::to_string(&Envelope::new(SessionResponse::Error { message }))
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(format!("{error}\n").as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+            continue;
+        }
         let response = match envelope.payload {
             SessionCommand::BindDisplayScope {
                 scope,
@@ -209,9 +217,16 @@ pub(crate) async fn handle_session_command(
                 }
             }
             SessionCommand::GetDisplayLayout => {
-                match crate::hardware::display_config::get_display_layout() {
-                    Ok(layout) => SessionResponse::DisplayLayout { layout },
-                    Err(message) => SessionResponse::Error { message },
+                match tokio::task::spawn_blocking(
+                    crate::hardware::display_config::get_display_layout,
+                )
+                .await
+                {
+                    Ok(Ok(layout)) => SessionResponse::DisplayLayout { layout },
+                    Ok(Err(message)) => SessionResponse::Error { message },
+                    Err(err) => SessionResponse::Error {
+                        message: err.to_string(),
+                    },
                 }
             }
             SessionCommand::SetDockMode { .. } => SessionResponse::Error {
@@ -371,9 +386,7 @@ fn backend_is_ready(backend: SessionBackend) -> bool {
             if !gui_session_env_ready() {
                 return false;
             }
-            Command::new("gdctl")
-                .arg("show")
-                .output()
+            crate::hardware::display_config::run_command_output_with_timeout("gdctl", &["show"], 2)
                 .map(|output| output.status.success())
                 .unwrap_or(false)
         }
@@ -381,11 +394,13 @@ fn backend_is_ready(backend: SessionBackend) -> bool {
             if !gui_session_env_ready() {
                 return false;
             }
-            Command::new("kscreen-doctor")
-                .arg("-j")
-                .output()
-                .map(|output| output.status.success())
-                .unwrap_or(false)
+            crate::hardware::display_config::run_command_output_with_timeout(
+                "kscreen-doctor",
+                &["-j"],
+                2,
+            )
+            .map(|output| output.status.success())
+            .unwrap_or(false)
         }
         SessionBackend::Niri => build_niri_command(&["msg", "--json", "outputs"])
             .and_then(|mut command| {
@@ -644,10 +659,12 @@ fn apply_niri_dock_mode(attached: bool) -> Result<(), String> {
 
 fn kde_output_logical_size(name: &str) -> Result<(i64, i64), String> {
     ensure_gui_session_env("KDE display query")?;
-    let output = Command::new("kscreen-doctor")
-        .arg("-j")
-        .output()
-        .map_err(|e| format!("Failed to run kscreen-doctor: {e}"))?;
+    let output = crate::hardware::display_config::run_command_output_with_timeout(
+        "kscreen-doctor",
+        &["-j"],
+        2,
+    )
+    .map_err(|e| format!("Failed to run kscreen-doctor: {e}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -1353,27 +1370,6 @@ fn read_accelerometer_orientation() -> Option<Orientation> {
     Some(orientation)
 }
 
-#[allow(dead_code)]
-fn dual_screen_is_active() -> bool {
-    // `gdctl` is the authoritative source for the active GNOME logical
-    // monitors.  Do not route this guard through the generic layout parser:
-    // a transient compositor refresh can omit a monitor there and suppress an
-    // otherwise valid rotation event.
-    Command::new("gdctl")
-        .arg("show")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter(|line| line.contains("Logical monitor #"))
-                .count()
-                >= 2
-        })
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1382,6 +1378,38 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test]
+    async fn safety_old_protocol_gets_explicit_rejection_without_running_mutation() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let gate = Arc::new(AgentDisplayGate::new("agent".into()));
+        let task = tokio::spawn(handle_session_command(server, gate.clone()));
+        let (reader, mut writer) = client.into_split();
+        let request = Envelope {
+            protocol_version: 2,
+            payload: SessionCommand::GetDisplayExecutionState,
+        };
+        writer
+            .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        let response = timeout(
+            Duration::from_secs(1),
+            BufReader::new(reader).lines().next_line(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            response.is_some(),
+            "Old protocol must get an explicit mismatch response"
+        );
+        let response: Envelope<SessionResponse> = serde_json::from_str(&response.unwrap()).unwrap();
+        assert!(matches!(response.payload, SessionResponse::Error { .. }));
+        assert!(gate.snapshot().active.is_none());
+        drop(writer);
+        task.abort();
+    }
 
     #[tokio::test]
     async fn timed_out_display_child_is_reaped_before_return() {

@@ -97,6 +97,7 @@ pub struct DisplaySafetyState {
     pub boot_id: String,
     pub daemon_id: String,
     pub lifecycle_epoch: u64,
+    pub suspended: bool,
     pub pending: Option<DockOperation>,
     pub manual_pending: bool,
     pub receipt_to_consume: Option<DockReceipt>,
@@ -115,6 +116,7 @@ impl Default for DisplaySafetyState {
             boot_id: String::new(),
             daemon_id: String::new(),
             lifecycle_epoch: 0,
+            suspended: false,
             pending: None,
             manual_pending: false,
             receipt_to_consume: None,
@@ -170,7 +172,13 @@ pub fn classify_dock_commit(
         MutationStatus::NotStarted { .. } => CommitDecision::NotStarted,
         MutationStatus::Verified
             if receipt.report.primary_enabled == Some(true)
-                && receipt.report.secondary_enabled == Some(!receipt.operation.attached) =>
+                && receipt.report.secondary_enabled == Some(!receipt.operation.attached)
+                && receipt.report.after
+                    == if receipt.operation.attached {
+                        PanelObservation::Disabled
+                    } else {
+                        PanelObservation::Enabled
+                    } =>
         {
             if latest_target == receipt.operation.target_generation {
                 CommitDecision::EvidenceAndTargetComplete
@@ -305,12 +313,37 @@ pub(crate) mod tests {
             classify_dock_commit(&scope(), 1, &r),
             CommitDecision::Unknown
         );
+        r.report = report();
+        r.report.after = PanelObservation::Enabled;
+        assert_eq!(
+            classify_dock_commit(&scope(), 1, &r),
+            CommitDecision::Unknown
+        );
         r.report.status = MutationStatus::Verified;
         r.report.secondary_enabled = Some(true);
         assert_eq!(
             classify_dock_commit(&scope(), 1, &r),
             CommitDecision::Unknown
         );
+    }
+    #[test]
+    fn safety_daemon_restart_keeps_uncertainty_but_new_boot_discards_old_operations() {
+        let mut s = DisplaySafetyState {
+            boot_id: "boot".into(),
+            daemon_id: "old".into(),
+            pending: Some(operation()),
+            manual_pending: true,
+            ..DisplaySafetyState::default()
+        };
+        s.begin_daemon("boot", "new".into());
+        assert!(s.degraded.is_some());
+        assert!(!s.manual_allowed);
+        assert!(s.pending.is_some());
+        s.begin_daemon("other-boot", "newer".into());
+        assert!(s.pending.is_none());
+        assert!(!s.manual_pending);
+        assert!(s.degraded.is_none());
+        assert_eq!(s.boot_id, "other-boot");
     }
 }
 
@@ -496,6 +529,14 @@ impl AgentDisplayGate {
             if matches!(report.status, MutationStatus::Unknown { .. }) {
                 g.blocked = Some("Display result could not be verified".into());
             }
+            if let MutationStatus::Unknown { reason } = &report.status {
+                log::warn!("display mutation kind={kind:?} scope={scope:?} outcome=unknown reason={reason} before={:?} after={:?}",report.before,report.after);
+            }
+            log::info!(
+                "display mutation kind={kind:?} scope={scope:?} outcome={:?} revision={}",
+                report.status,
+                report.revision_after
+            );
             g.last_mutation = Some(MutationRecord {
                 kind,
                 report: report.clone(),

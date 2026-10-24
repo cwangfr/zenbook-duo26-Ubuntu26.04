@@ -155,7 +155,7 @@ IDs: use OS randomness available via std filesystem (`/proc/sys/kernel/random/uu
 - [x] Interface consistency: operation/scope/receipt definitions above are shared; query never takes mutation lock; only daemon drain commits automatic O.
 - [x] Review Focus: all five conditions have explicit failure assertions in named tasks.
 - [x] Scope: no reconnect, GDM, kernel, dependency additions or live deployment.
-- [ ] User reviews plan and chooses Native or Subagent-driven execution.
-- [ ] At execution start, set up/verify workspace per using-git-worktrees, record baseline source and tests, and create the per-plan execution ledger.
+- [x] User reviewed the plan and chose Native: “native 开始”.
+- [x] Execution uses the explicitly selected current feature branch; baseline 84 tests passed; per-plan ledger created.
 
-Execution preference has not yet been supplied. Recommend Native for these five closely coupled tasks, with an independent final branch review; all tasks share the same protocol, scope and receipt contracts, so maintaining one implementation context reduces integration churn. The approved design remains the authority if a detail in this plan conflicts with it.
+Execution method: Native, selected by the user. These five tasks are closely coupled, with an independent final branch review; all tasks share the same protocol, scope and receipt contracts, so maintaining one implementation context reduces integration churn. The approved design remains the authority if a detail in this plan conflicts with it.

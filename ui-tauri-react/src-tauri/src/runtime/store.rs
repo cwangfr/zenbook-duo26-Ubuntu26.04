@@ -1,7 +1,7 @@
 use crate::runtime::state::RuntimeState;
-use chrono::{DateTime, Utc};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -10,7 +10,7 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 pub struct RuntimeStore {
     path: PathBuf,
-    last_saved: Mutex<Option<DateTime<Utc>>>,
+    last_saved: Mutex<Option<(u64, Vec<u8>)>>,
 }
 impl RuntimeStore {
     pub fn new(path: PathBuf) -> Self {
@@ -43,7 +43,11 @@ impl RuntimeStore {
             .last_saved
             .lock()
             .map_err(|_| "Runtime store lock poisoned".to_string())?;
-        if last.is_some_and(|saved| state.last_updated < saved) {
+        let json = serde_json::to_vec_pretty(state).map_err(|e| e.to_string())?;
+        if last.as_ref().is_some_and(|(revision, bytes)| {
+            state.snapshot_revision < *revision
+                || (state.snapshot_revision == *revision && &json != bytes)
+        }) {
             return Err("Refusing stale runtime snapshot".into());
         }
         let parent = self
@@ -57,12 +61,15 @@ impl RuntimeStore {
             NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
         ));
         let result = (|| {
+            let permissions = fs::metadata(&self.path)
+                .map(|m| m.permissions().mode() & 0o777)
+                .unwrap_or(0o644);
             let mut file = OpenOptions::new()
+                .mode(permissions)
                 .write(true)
                 .create_new(true)
                 .open(&tmp)
                 .map_err(|e| e.to_string())?;
-            let json = serde_json::to_vec_pretty(state).map_err(|e| e.to_string())?;
             check("write")?;
             file.write_all(&json).map_err(|e| e.to_string())?;
             check("file_sync")?;
@@ -74,7 +81,7 @@ impl RuntimeStore {
             File::open(parent)
                 .and_then(|dir| dir.sync_all())
                 .map_err(|e| e.to_string())?;
-            *last = Some(state.last_updated);
+            *last = Some((state.snapshot_revision, json.clone()));
             Ok(())
         })();
         let _ = fs::remove_file(tmp);
@@ -138,6 +145,7 @@ mod tests {
             let mut state = RuntimeState::default();
             s.save(&state).unwrap();
             state.secondary_panel_disabled_by_runtime = true;
+            state.touch();
             assert!(s
                 .save_checked(&state, |at| if at == stage {
                     Err("injected I/O failure".into())
@@ -150,5 +158,42 @@ mod tests {
             assert_eq!(fs::read_dir(s.path.parent().unwrap()).unwrap().count(), 1);
             fs::remove_dir_all(s.path.parent().unwrap()).unwrap();
         }
+    }
+    #[test]
+    fn safety_clock_rollback_does_not_break_save_but_stale_clone_is_rejected() {
+        let s = store();
+        let mut current = RuntimeState::default();
+        s.save(&current).unwrap();
+        let mut stale = current.clone();
+        current.touch();
+        current.last_updated -= chrono::Duration::days(1);
+        current.secondary_panel_disabled_by_runtime = true;
+        s.save(&current)
+            .expect("Wall clock is diagnostics, not snapshot ordering");
+        stale.touch();
+        stale.status.keyboard_attached = true;
+        assert!(s.save(&stale).is_err());
+        assert!(
+            s.load()
+                .unwrap()
+                .unwrap()
+                .secondary_panel_disabled_by_runtime
+        );
+        fs::remove_dir_all(s.path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn replacing_snapshot_preserves_restricted_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = store();
+        let mut state = RuntimeState::default();
+        s.save(&state).unwrap();
+        fs::set_permissions(&s.path, fs::Permissions::from_mode(0o600)).unwrap();
+        state.touch();
+        s.save(&state).unwrap();
+        assert_eq!(
+            fs::metadata(&s.path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(s.path.parent().unwrap()).unwrap();
     }
 }

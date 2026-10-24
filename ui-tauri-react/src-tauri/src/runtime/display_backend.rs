@@ -41,7 +41,15 @@ pub(crate) fn confirmed_report(
             if !matches!(report.before, PanelObservation::Unknown { .. })
                 && !matches!(report.after, PanelObservation::Unknown { .. })
                 && report.primary_enabled == Some(true)
-                && attached.is_none_or(|a| report.secondary_enabled == Some(!a)) =>
+                && attached.is_none_or(|a| {
+                    report.secondary_enabled == Some(!a)
+                        && report.after
+                            == if a {
+                                PanelObservation::Disabled
+                            } else {
+                                PanelObservation::Enabled
+                            }
+                }) =>
         {
             MutationStatus::Verified
         }

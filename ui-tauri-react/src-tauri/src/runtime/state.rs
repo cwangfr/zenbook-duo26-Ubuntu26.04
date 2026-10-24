@@ -21,6 +21,8 @@ pub struct RuntimeState {
     pub display_executor: Arc<tokio::sync::Mutex<()>>,
     #[serde(default)]
     pub display_safety: crate::runtime::display_safety::DisplaySafetyState,
+    #[serde(default)]
+    pub snapshot_revision: u64,
     pub status: DuoStatus,
     pub settings: DuoSettings,
     pub session_agent: SessionAgentState,
@@ -53,6 +55,7 @@ impl Default for RuntimeState {
             drm_root: default_drm_root(),
             display_executor: Default::default(),
             display_safety: Default::default(),
+            snapshot_revision: 0,
             status: DuoStatus::default(),
             settings: DuoSettings::default(),
             session_agent: SessionAgentState::default(),
@@ -122,6 +125,7 @@ impl RuntimeState {
     }
 
     pub fn touch(&mut self) {
+        self.snapshot_revision = self.snapshot_revision.saturating_add(1);
         self.last_updated = Utc::now();
     }
 

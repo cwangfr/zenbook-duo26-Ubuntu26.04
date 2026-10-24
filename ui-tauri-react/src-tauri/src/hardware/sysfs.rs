@@ -167,19 +167,23 @@ pub fn is_service_active() -> bool {
 }
 
 fn is_unit_active_user(unit: &str) -> bool {
-    std::process::Command::new("systemctl")
-        .args(["--user", "is-active", unit])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
-        .unwrap_or(false)
+    crate::hardware::display_config::run_command_output_with_timeout(
+        "systemctl",
+        &["--user", "is-active", unit],
+        2,
+    )
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+    .unwrap_or(false)
 }
 
 fn is_unit_active_system(unit: &str) -> bool {
-    std::process::Command::new("systemctl")
-        .args(["is-active", unit])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
-        .unwrap_or(false)
+    crate::hardware::display_config::run_command_output_with_timeout(
+        "systemctl",
+        &["is-active", unit],
+        2,
+    )
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+    .unwrap_or(false)
 }
 
 pub fn get_full_status() -> DuoStatus {

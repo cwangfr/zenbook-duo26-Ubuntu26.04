@@ -445,10 +445,12 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<RuntimeState>>) -> 
                         DaemonResponse::SessionRegistered {
                             scope,
                             automatic_blocked: g.display_safety.degraded.is_some()
+                                || g.display_safety.suspended
                                 || g.storage_fault.is_some(),
                             manual_allowed: g.display_safety.manual_allowed
                                 && g.display_safety.pending.is_none()
                                 && !g.display_safety.manual_pending
+                                && !g.display_safety.suspended
                                 && g.storage_fault.is_none(),
                         }
                     }
@@ -545,96 +547,31 @@ async fn handle_lifecycle(
     state: &Arc<RwLock<RuntimeState>>,
     phase: LifecyclePhase,
 ) -> Result<(), String> {
-    match phase {
-        LifecyclePhase::Pre | LifecyclePhase::Hibernate | LifecyclePhase::Shutdown => {
-            logger::append_line(format!("rust-daemon: lifecycle -> {:?}", phase)).ok();
-            hardware::hid::set_backlight(0)?;
-
-            let mut guard = state.write().await;
-            guard.recent_events.push(HardwareEvent::info(
-                EventCategory::Service,
-                format!("Lifecycle event: {:?}", phase),
-                "rust-daemon",
-            ));
-            guard.touch();
-            persist_state(&guard);
-            Ok(())
-        }
-        LifecyclePhase::Post | LifecyclePhase::Thaw | LifecyclePhase::Boot => {
-            logger::append_line(format!("rust-daemon: lifecycle -> {:?}", phase)).ok();
-
-            let (restore_level, scale) = {
-                let guard = state.read().await;
-                (guard.status.backlight_level, guard.settings.default_scale)
-            };
-            hardware::hid::set_backlight(restore_level)?;
-
-            let refreshed = crate::runtime::probe::current_status();
-            let attached = refreshed.keyboard_attached;
-
-            {
-                let mut guard = state.write().await;
-                let previous_level = guard.status.backlight_level;
-                guard.status = refreshed;
-                guard.status.backlight_level = previous_level;
-                guard.status.service_active = guard.session_agent.connected;
-                guard.recent_events.push(HardwareEvent::info(
-                    EventCategory::Service,
-                    format!("Lifecycle event: {:?}", phase),
-                    "rust-daemon",
-                ));
-                guard.touch();
-                persist_state(&guard);
-            }
-
-            // Restore touchscreen disabled state
-            {
-                let guard = state.read().await;
-                let disabled = guard.settings.touchscreen_disabled.clone();
-                drop(guard);
-                for connector in &disabled {
-                    let devices = hardware::touchscreen::list_touchscreens();
-                    if let Some(dev) = devices.iter().find(|d| &d.connector == connector) {
-                        if let Err(e) =
-                            hardware::touchscreen::set_touchscreen_enabled(&dev.i2c_id, false)
-                        {
-                            eprintln!(
-                                "rust-daemon: failed to restore touchscreen disabled for {}: {}",
-                                connector, e
-                            );
-                        }
-                    }
+    let restore = matches!(
+        phase,
+        LifecyclePhase::Post | LifecyclePhase::Thaw | LifecyclePhase::Boot
+    );
+    let result = handle_lifecycle_with(
+        state,
+        phase,
+        crate::runtime::probe::keyboard_attached(),
+        hardware::hid::set_backlight,
+    )
+    .await;
+    if restore {
+        let disabled = state.read().await.settings.touchscreen_disabled.clone();
+        tokio::task::spawn_blocking(move || {
+            for connector in disabled {
+                if let Some(dev) = hardware::touchscreen::list_touchscreens()
+                    .iter()
+                    .find(|d| d.connector == connector)
+                {
+                    let _ = hardware::touchscreen::set_touchscreen_enabled(&dev.i2c_id, false);
                 }
             }
-
-            if matches!(phase, LifecyclePhase::Boot) {
-                mark_startup_replay_pending_from_boot().await;
-                logger::append_line(
-                    "rust-daemon: lifecycle boot marked startup replay pending".to_string(),
-                )
-                .ok();
-                return Ok(());
-            }
-
-            match replay_current_dock_mode(state, attached, scale).await {
-                Ok(()) => Ok(()),
-                Err(err) => {
-                    notify_runtime_error(
-                        state,
-                        "Zenbook Duo Runtime Error",
-                        &format!("Lifecycle dock refresh skipped: {err}"),
-                    )
-                    .await;
-                    logger::append_line(format!(
-                        "rust-daemon: lifecycle dock refresh skipped: {}",
-                        err
-                    ))
-                    .ok();
-                    Ok(())
-                }
-            }
-        }
+        });
     }
+    result
 }
 
 pub(crate) async fn handle_session_registration(
@@ -1306,4 +1243,87 @@ mod tests {
             .as_nanos();
         std::env::temp_dir().join(format!("zenbook-duo-{label}-{nanos}-{id}.sock"))
     }
+}
+
+pub(crate) async fn advance_display_epoch(
+    state: &Arc<RwLock<RuntimeState>>,
+    phase: LifecyclePhase,
+) -> Result<(), String> {
+    let registered = {
+        let mut g = state.write().await;
+        g.display_safety.lifecycle_epoch = g
+            .display_safety
+            .lifecycle_epoch
+            .checked_add(1)
+            .ok_or("Lifecycle epoch exhausted")?;
+        g.display_safety.suspended = matches!(
+            phase,
+            LifecyclePhase::Pre | LifecyclePhase::Hibernate | LifecyclePhase::Shutdown
+        );
+        if g.display_safety.pending.is_some() || g.display_safety.manual_pending {
+            g.display_safety.degraded =
+                Some("Display operation crossed a lifecycle boundary".into());
+            g.display_safety.manual_allowed = false;
+        }
+        let epoch = g.display_safety.lifecycle_epoch;
+        if let Some(scope) = &mut g.session_agent.scope {
+            scope.lifecycle_epoch = epoch;
+        }
+        g.recent_events.push(HardwareEvent::info(
+            EventCategory::Service,
+            format!("Lifecycle event: {phase:?}"),
+            "rust-daemon",
+        ));
+        g.touch();
+        if let Err(e) = g.save() {
+            g.storage_fault = Some(e.clone());
+            return Err(e);
+        }
+        g.session_agent.connected
+    };
+    if registered {
+        if let Err(reason) = super::dock_transaction::bind_current_context(state).await {
+            super::dock_transaction::degrade(state, reason.clone()).await;
+            return Err(reason);
+        }
+    }
+    Ok(())
+}
+pub(crate) async fn handle_lifecycle_with<F>(
+    state: &Arc<RwLock<RuntimeState>>,
+    phase: LifecyclePhase,
+    attached: bool,
+    backlight: F,
+) -> Result<(), String>
+where
+    F: FnOnce(u8) -> Result<(), String> + Send + 'static,
+{
+    let epoch_result = advance_display_epoch(state, phase.clone()).await;
+    let (level, scale) = {
+        let mut g = state.write().await;
+        g.status.keyboard_attached = attached;
+        (g.status.backlight_level, g.settings.default_scale)
+    };
+    match phase {
+        LifecyclePhase::Boot => {
+            mark_startup_replay_pending_from_boot().await;
+        }
+        LifecyclePhase::Post | LifecyclePhase::Thaw => {
+            let _ = replay_current_dock_mode(state, attached, scale).await;
+        }
+        _ => {}
+    }
+    let level = if matches!(
+        phase,
+        LifecyclePhase::Pre | LifecyclePhase::Hibernate | LifecyclePhase::Shutdown
+    ) {
+        0
+    } else {
+        level
+    };
+    let backlight_result = tokio::task::spawn_blocking(move || backlight(level))
+        .await
+        .map_err(|e| e.to_string())?;
+    epoch_result?;
+    backlight_result
 }

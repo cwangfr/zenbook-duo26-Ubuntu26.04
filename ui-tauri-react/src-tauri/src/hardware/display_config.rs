@@ -497,10 +497,7 @@ fn apply_gnome_display_layout(layout: &DisplayLayout) -> Result<(), String> {
 }
 
 fn get_kde_display_layout() -> Result<DisplayLayout, String> {
-    let output = Command::new("kscreen-doctor")
-        .arg("-j")
-        .output()
-        .map_err(|e| format!("Failed to run kscreen-doctor: {e}"))?;
+    let output = run_command_output_with_timeout("kscreen-doctor", &["-j"], 2)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -653,10 +650,7 @@ fn apply_kde_display_layout(layout: &DisplayLayout) -> Result<(), String> {
 }
 
 fn get_niri_display_layout() -> Result<DisplayLayout, String> {
-    let output = Command::new("niri")
-        .args(["msg", "--json", "outputs"])
-        .output()
-        .map_err(|e| format!("Failed to run niri msg: {e}"))?;
+    let output = run_command_output_with_timeout("niri", &["msg", "--json", "outputs"], 2)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -825,14 +819,14 @@ fn apply_niri_display_layout(layout: &DisplayLayout) -> Result<(), String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisplayBackend {
+pub(crate) enum DisplayBackend {
     Gnome,
     Kde,
     Niri,
     Unknown,
 }
 
-fn detect_backend() -> DisplayBackend {
+pub(crate) fn detect_backend() -> DisplayBackend {
     let current = env::var("XDG_CURRENT_DESKTOP")
         .or_else(|_| env::var("XDG_SESSION_DESKTOP"))
         .or_else(|_| env::var("DESKTOP_SESSION"))
@@ -1009,10 +1003,7 @@ fn build_gnome_orientation_args(
 }
 
 fn kde_output_logical_size(name: &str) -> Result<(i64, i64), String> {
-    let output = Command::new("kscreen-doctor")
-        .arg("-j")
-        .output()
-        .map_err(|e| format!("Failed to run kscreen-doctor: {e}"))?;
+    let output = run_command_output_with_timeout("kscreen-doctor", &["-j"], 2)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -1044,10 +1035,7 @@ fn kde_output_logical_size(name: &str) -> Result<(i64, i64), String> {
 }
 
 fn kde_enabled_output_count() -> Result<usize, String> {
-    let output = Command::new("kscreen-doctor")
-        .arg("-j")
-        .output()
-        .map_err(|e| format!("Failed to run kscreen-doctor: {e}"))?;
+    let output = run_command_output_with_timeout("kscreen-doctor", &["-j"], 2)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -1119,10 +1107,7 @@ fn set_kde_orientation(orientation: &Orientation) -> Result<(), String> {
 }
 
 fn niri_output_logical_size(name: &str) -> Result<(i64, i64), String> {
-    let output = Command::new("niri")
-        .args(["msg", "--json", "outputs"])
-        .output()
-        .map_err(|e| format!("Failed to run niri msg: {e}"))?;
+    let output = run_command_output_with_timeout("niri", &["msg", "--json", "outputs"], 2)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -1153,10 +1138,7 @@ fn niri_output_logical_size(name: &str) -> Result<(i64, i64), String> {
 }
 
 fn niri_enabled_output_count() -> Result<usize, String> {
-    let output = Command::new("niri")
-        .args(["msg", "--json", "outputs"])
-        .output()
-        .map_err(|e| format!("Failed to run niri msg: {e}"))?;
+    let output = run_command_output_with_timeout("niri", &["msg", "--json", "outputs"], 2)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }

@@ -336,6 +336,53 @@ restarts during one boot but is discarded after reboot, preventing stale
 state from reopening a display unexpectedly. USB polling reads sysfs directly
 instead of running `lsusb` every second, avoiding repetitive AppArmor denials.
 
+### Display transaction safety (protocol 3)
+
+Automatic Dock updates from startup, session registration, resume and keyboard
+monitoring share one transaction path. The session agent serializes Dock,
+manual layout, manual rotation and sensor rotation. An unknown or unowned
+secondary-panel shutdown is not automatically treated as permission to reopen
+it. Logical layout verification is not proof of a healthy physical Xe pipe.
+
+A request timeout may leave an operation running. The daemon retains its scoped
+operation ID, queries its result without repeating the modeset, and persists
+pending state before dispatch. Unknown results enter `Degraded`: automatic
+layout writes, including sensor rotation, stay paused for that boot. A later
+verified result can restore explicit manual layout access, but does not restart
+automatic switching. An unknown or stale-session result cannot restore manual
+access. A new boot discards the previous boot's operation evidence and ownership;
+it does not prove that a hardware fault has recovered.
+
+State snapshots use atomic replacement and filesystem synchronization. Corrupt
+state or failed safety-state writes block new layout operations. Diagnostics in
+the system/user journals distinguish a missing/unreadable connector from a
+confirmed disabled panel and include scope, target and operation identities.
+Do not delete pending state or restart services to bypass a display protection.
+
+This is the safety prerequisite for fork issue #2. It does not implement issue
+#1's automatic reconnection or the GDM-to-GNOME ownership handoff. In particular,
+conservative refusal to reopen an unowned panel is not a successful recovery.
+
+All protocol participants must be built from the same revision: daemon, session
+agent, lifecycle/helper binaries **and the Tauri control panel**. Mixed protocol
+versions are rejected. Before any deployment, stop the old control panel,
+including its tray process, and old runtime processes: an old UI can still
+contain a direct-backend fallback that the new daemon cannot prevent. Replacing
+its binary on disk does not replace an already running process.
+
+Code verification does not install or restart these services. A deployment
+record must include the Git revision, Cargo.lock hash, hashes of all four runtime
+binaries and each running executable, systemd ExecStart, kernel, locale and boot
+ID. Validate normal attach/detach and safety outcomes separately from issue #1's
+ten-cycle suspend/resume acceptance test.
+
+For source rollback, `2b95a38` is the pre-implementation revision. Keep a copy of
+the current branch, stop all UI/runtime processes, and rebuild matching runtime
+and UI versions from that revision. Do not start the old implementation over an
+unresolved pending operation in the same boot; use a clean reboot before
+returning to the old runtime. Its original display-safety limitations still
+apply. GDM, kernel and firmware settings are not changed by this work.
+
 ## Troubleshooting
 
 Watch the runtime:

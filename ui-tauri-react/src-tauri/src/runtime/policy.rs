@@ -1,4 +1,3 @@
-use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -72,10 +71,12 @@ pub fn apply_transition_policy(
 }
 
 pub fn ensure_bluetooth_enabled() -> Result<(), String> {
-    let output = Command::new("rfkill")
-        .args(["unblock", "bluetooth"])
-        .output()
-        .map_err(|e| format!("Failed to run rfkill: {e}"))?;
+    let output = crate::hardware::display_config::run_command_output_with_timeout(
+        "rfkill",
+        &["unblock", "bluetooth"],
+        2,
+    )
+    .map_err(|e| format!("Failed to run rfkill: {e}"))?;
     if !output.status.success() {
         return Err(format!(
             "rfkill unblock bluetooth failed: {}",
@@ -87,10 +88,12 @@ pub fn ensure_bluetooth_enabled() -> Result<(), String> {
     // before the detached keyboard can reconnect.
     let mut failures = Vec::new();
     for attempt in 1..=3 {
-        let output = Command::new("bluetoothctl")
-            .args(["power", "on"])
-            .output()
-            .map_err(|e| format!("Failed to run bluetoothctl: {e}"))?;
+        let output = crate::hardware::display_config::run_command_output_with_timeout(
+            "bluetoothctl",
+            &["power", "on"],
+            2,
+        )
+        .map_err(|e| format!("Failed to run bluetoothctl: {e}"))?;
 
         if output.status.success() && crate::runtime::probe::bluetooth_enabled() {
             return Ok(());

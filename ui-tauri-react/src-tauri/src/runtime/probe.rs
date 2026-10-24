@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use crate::hardware::{display_config, sysfs};
 use crate::models::{DisplayLayout, DuoStatus, Orientation};
@@ -54,9 +53,7 @@ fn usb_id_matches(path: &Path, expected: &str) -> bool {
 }
 
 pub fn wifi_enabled() -> bool {
-    Command::new("nmcli")
-        .args(["radio", "wifi"])
-        .output()
+    display_config::run_command_output_with_timeout("nmcli", &["radio", "wifi"], 2)
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.lines().next().unwrap_or_default().trim() == "enabled")
@@ -64,9 +61,7 @@ pub fn wifi_enabled() -> bool {
 }
 
 pub fn bluetooth_enabled() -> bool {
-    Command::new("bluetoothctl")
-        .arg("show")
-        .output()
+    display_config::run_command_output_with_timeout("bluetoothctl", &["show"], 2)
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| bluetooth_controller_powered(&s))
