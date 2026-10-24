@@ -109,6 +109,8 @@ pub struct DisplaySafetyState {
     pub last_seen_revision: Option<u64>,
     #[serde(skip)]
     pub worker_running: bool,
+    #[serde(skip)]
+    pub resume_grace_until: Option<std::time::Instant>,
 }
 impl Default for DisplaySafetyState {
     fn default() -> Self {
@@ -127,6 +129,7 @@ impl Default for DisplaySafetyState {
             next_target_generation: 0,
             last_seen_revision: None,
             worker_running: false,
+            resume_grace_until: None,
         }
     }
 }
@@ -160,6 +163,10 @@ pub fn automatic_dock_allowed(
             PanelObservation::Unknown { .. } => false,
         }
 }
+pub(crate) fn closed_laptop_panel_refusal(reason: &str) -> bool {
+    reason.contains("Refusing to activate a closed laptop panel")
+}
+
 pub fn classify_dock_commit(
     current_scope: &DisplayScope,
     latest_target: u64,
@@ -170,6 +177,9 @@ pub fn classify_dock_commit(
     }
     match &receipt.report.status {
         MutationStatus::NotStarted { .. } => CommitDecision::NotStarted,
+        MutationStatus::KnownFailure { reason } if closed_laptop_panel_refusal(reason) => {
+            CommitDecision::NotStarted
+        }
         MutationStatus::Verified
             if receipt.report.primary_enabled == Some(true)
                 && receipt.report.secondary_enabled == Some(!receipt.operation.attached)

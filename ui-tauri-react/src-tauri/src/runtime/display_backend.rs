@@ -36,6 +36,14 @@ pub(crate) fn confirmed_report(
         }
     }
     report.status = match result {
+        Err(reason)
+            if closed_laptop_panel_refusal(&reason)
+                && report.before == report.after
+                && !matches!(report.before, PanelObservation::Unknown { .. })
+                && report.primary_enabled == Some(true) =>
+        {
+            MutationStatus::KnownFailure { reason }
+        }
         Err(reason) => MutationStatus::Unknown { reason },
         Ok(())
             if !matches!(report.before, PanelObservation::Unknown { .. })
@@ -252,6 +260,58 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn closed_laptop_panel_refusal_with_unchanged_panels_is_known_failure() {
+        let mut layout = sample_layout(1.666667);
+        layout
+            .displays
+            .iter_mut()
+            .find(|display| display.connector == "eDP-2")
+            .unwrap()
+            .enabled = false;
+        let report = confirmed_report(
+            PanelObservation::Disabled,
+            Err("Failed to apply configuration: Refusing to activate a closed laptop panel".into()),
+            PanelObservation::Disabled,
+            Ok(layout),
+            Some(true),
+        );
+        assert_eq!(
+            report.status,
+            MutationStatus::KnownFailure {
+                reason: "Failed to apply configuration: Refusing to activate a closed laptop panel"
+                    .into()
+            }
+        );
+    }
+
+    #[test]
+    fn closed_laptop_panel_refusal_stays_unknown_when_panel_changes_or_reason_differs() {
+        let mut layout = sample_layout(1.666667);
+        layout
+            .displays
+            .iter_mut()
+            .find(|display| display.connector == "eDP-2")
+            .unwrap()
+            .enabled = false;
+        let changed = confirmed_report(
+            PanelObservation::Disabled,
+            Err("Failed to apply configuration: Refusing to activate a closed laptop panel".into()),
+            PanelObservation::Enabled,
+            Ok(layout.clone()),
+            Some(true),
+        );
+        let other = confirmed_report(
+            PanelObservation::Disabled,
+            Err("gdctl set failed: something else".into()),
+            PanelObservation::Disabled,
+            Ok(layout),
+            Some(true),
+        );
+        assert!(matches!(changed.status, MutationStatus::Unknown { .. }));
+        assert!(matches!(other.status, MutationStatus::Unknown { .. }));
     }
 
     #[test]

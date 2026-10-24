@@ -1350,6 +1350,10 @@ pub(crate) async fn advance_display_epoch(
             phase,
             LifecyclePhase::Pre | LifecyclePhase::Hibernate | LifecyclePhase::Shutdown
         );
+        if matches!(phase, LifecyclePhase::Post | LifecyclePhase::Thaw) {
+            g.display_safety.resume_grace_until =
+                Some(std::time::Instant::now() + RESUME_GRACE_WINDOW);
+        }
         if g.display_safety.pending.is_some() || g.display_safety.manual_pending {
             g.display_safety.degraded =
                 Some("Display operation crossed a lifecycle boundary".into());

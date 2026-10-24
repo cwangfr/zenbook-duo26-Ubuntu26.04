@@ -207,6 +207,7 @@ pub(crate) async fn resume_dock_target(state: &Arc<RwLock<RuntimeState>>) {
 pub async fn drain_dock_targets(state: Arc<RwLock<RuntimeState>>) -> Result<(), String> {
     let executor = state.read().await.display_executor.clone();
     let _execution = executor.lock().await;
+    let mut closed_panel_retries = 0;
     loop {
         let target = state.read().await.display_safety.target.clone();
         let Some(target) = target else {
@@ -214,7 +215,38 @@ pub async fn drain_dock_targets(state: Arc<RwLock<RuntimeState>>) -> Result<(), 
             return Ok(());
         };
         let result = drain_one(&state, &target).await;
+        if result
+            .as_ref()
+            .is_err_and(|reason| closed_laptop_panel_refusal(reason))
+            && closed_panel_retries < 4
+            && state
+                .read()
+                .await
+                .display_safety
+                .resume_grace_until
+                .is_some_and(|deadline| std::time::Instant::now() < deadline)
+        {
+            closed_panel_retries += 1;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
         let mut g = state.write().await;
+        if result
+            .as_ref()
+            .is_err_and(|reason| closed_laptop_panel_refusal(reason))
+            && g.display_safety.degraded.is_none()
+        {
+            if g.display_safety
+                .target
+                .as_ref()
+                .is_some_and(|current| current.generation == target.generation)
+            {
+                g.display_safety.target = None;
+                let _ = save(&mut g);
+            }
+            g.display_safety.worker_running = false;
+            return Ok(());
+        }
         if result.is_err() {
             let changed = g
                 .display_safety
@@ -357,6 +389,7 @@ async fn finish_receipt(
 ) -> Result<(), String> {
     let mut verified = false;
     let mut completed_current = false;
+    let closed_lid = matches!(&receipt.report.status, MutationStatus::KnownFailure { reason } if closed_laptop_panel_refusal(reason));
     {
         let mut g = state.write().await;
         if g.display_safety.pending.as_ref() != Some(&receipt.operation) {
@@ -400,7 +433,8 @@ async fn finish_receipt(
             }
             g.display_safety.last_seen_revision = Some(report.revision_after);
         } else if decision == CommitDecision::NotStarted {
-            let transient = matches!(&report.status,
+            let transient = closed_lid
+                || matches!(&report.status,
                 MutationStatus::NotStarted { reason } if reason == "Busy" || reason == "RevisionChanged");
             if !transient
                 && g.display_safety.target.as_ref().map(|t| t.generation)
@@ -413,7 +447,7 @@ async fn finish_receipt(
                 Some(format!("Display result cannot be adopted: {decision:?}"));
             g.display_safety.manual_allowed = false;
         }
-        if started && !verified {
+        if started && !verified && !closed_lid {
             g.display_safety
                 .degraded
                 .get_or_insert("Display operation outcome is unknown".into());
@@ -422,6 +456,11 @@ async fn finish_receipt(
         save(&mut g)?;
     }
     consume_saved_receipt(state).await?;
+    if closed_lid {
+        return Err(
+            "Failed to apply configuration: Refusing to activate a closed laptop panel".into(),
+        );
+    }
     let _ = bind_current_context(state).await;
     if completed_current {
         let still_current = {
@@ -809,6 +848,20 @@ mod tests {
                                 operation.scope.clone(),
                                 Some(operation.clone()),
                                 move || async move {
+                                    if r.join("refuse-closed-laptop").exists() {
+                                        std::fs::remove_file(r.join("refuse-closed-laptop")).unwrap();
+                                        return MutationReport {
+                                            before: PanelObservation::Disabled,
+                                            after: PanelObservation::Disabled,
+                                            primary_enabled: Some(true),
+                                            secondary_enabled: Some(false),
+                                            revision_before: 0,
+                                            revision_after: 0,
+                                            status: MutationStatus::KnownFailure {
+                                                reason: "Failed to apply configuration: Refusing to activate a closed laptop panel".into(),
+                                            },
+                                        };
+                                    }
                                     if let Some(n) = delay {
                                         n.notified().await;
                                     }
@@ -1571,6 +1624,43 @@ mod tests {
         let g = f.state.read().await;
         assert!(g.session_agent.connected);
         assert!(g.display_safety.degraded.is_none());
+    }
+    #[tokio::test]
+    async fn closed_laptop_panel_refusal_outside_resume_grace_does_not_degrade() {
+        let f = fixture("enabled", None).await;
+        super::super::daemon::reset_resume_grace_for_test().await;
+        std::fs::write(f.root.join("refuse-closed-laptop"), "").unwrap();
+        submit_dock_target(&f.state, true, 1.67, DockSource::Resume)
+            .await
+            .unwrap();
+        idle(&f).await;
+        let g = f.state.read().await;
+        assert!(g.display_safety.degraded.is_none());
+        assert!(g.display_safety.manual_allowed);
+        assert!(g.display_safety.target.is_none());
+        drop(g);
+        assert!(f.gate.snapshot().blocked.is_none());
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn closed_laptop_panel_refusal_retries_within_resume_grace_without_degrading() {
+        let f = fixture("enabled", None).await;
+        super::super::daemon::advance_display_epoch(&f.state, LifecyclePhase::Post)
+            .await
+            .unwrap();
+        std::fs::write(f.root.join("refuse-closed-laptop"), "").unwrap();
+        submit_dock_target(&f.state, true, 1.67, DockSource::Resume)
+            .await
+            .unwrap();
+        idle(&f).await;
+        let g = f.state.read().await;
+        assert!(g.display_safety.degraded.is_none());
+        assert!(g.display_safety.manual_allowed);
+        assert!(g.display_safety.target.is_none());
+        assert!(g.secondary_panel_disabled_by_runtime);
+        drop(g);
+        assert!(f.gate.snapshot().blocked.is_none());
+        assert_eq!(f.calls.load(Ordering::SeqCst), 2);
     }
     #[tokio::test]
     async fn layout_probe_inflight_across_suspend_does_not_disconnect() {
