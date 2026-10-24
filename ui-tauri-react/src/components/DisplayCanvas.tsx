@@ -9,6 +9,7 @@ import {
   useNodesState,
 } from "@xyflow/react";
 
+import { gnomeUiNumbers } from "@/lib/gnome-ui-number.ts";
 import type { DisplayLayout } from "@/types/duo";
 import { cn } from "@/lib/utils";
 
@@ -18,6 +19,7 @@ interface DisplayCanvasProps {
 }
 
 type DisplayNodeData = {
+  gnomeNumber: number;
   connector: string;
   width: number;
   height: number;
@@ -105,10 +107,13 @@ function DisplayNode({ data, selected }: NodeProps<Node<DisplayNodeData>>) {
       <div className="flex h-full flex-col justify-between p-3">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <div className="truncate font-mono text-[13px] font-semibold">
+            <div className="truncate font-mono text-[15px] font-semibold">
+              {data.gnomeNumber}
+            </div>
+            <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
               {data.connector}
             </div>
-            <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">
+            <div className="font-mono text-[11px] text-muted-foreground">
               {data.width}x{data.height} @ {data.refreshRate.toFixed(1)}Hz
             </div>
           </div>
@@ -137,6 +142,7 @@ const nodeTypes = { displayNode: DisplayNode };
 
 function layoutToNodes(layout: DisplayLayout): Node<DisplayNodeData>[] {
   const normalizedLayout = normalizeDuoDisplays(layout);
+  const gnomeNumbers = gnomeUiNumbers(layout.displays.map((display) => display.connector));
 
   // If multiple displays share (x,y), stagger them for usability.
   const primary =
@@ -172,6 +178,7 @@ function layoutToNodes(layout: DisplayLayout): Node<DisplayNodeData>[] {
       draggable: !isDuoDisplay(d.connector),
       selectable: true,
       data: {
+        gnomeNumber: gnomeNumbers.get(d.connector) ?? 0,
         connector: d.connector,
         width: d.width,
         height: d.height,

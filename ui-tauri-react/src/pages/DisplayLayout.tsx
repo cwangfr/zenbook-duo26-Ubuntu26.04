@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import DisplayCanvas from "@/components/DisplayCanvas";
+import { gnomeUiNumbers } from "@/lib/gnome-ui-number.ts";
 import { getDisplayLayout, applyDisplayLayout, listTouchscreens, setTouchscreenEnabled, loadSettings, saveSettings } from "@/lib/tauri";
 import type { DisplayInfo, DisplayLayout as LayoutType, TouchscreenDevice } from "@/types/duo";
 import { Button } from "@/components/ui/button";
@@ -38,6 +39,7 @@ function modesForResolution(display: DisplayInfo, width: number, height: number)
 
 export default function DisplayLayout() {
   const [layout, setLayout] = useState<LayoutType>({ displays: [] });
+  const gnomeNumbers = gnomeUiNumbers(layout.displays.map((display) => display.connector));
   const [applying, setApplying] = useState(false);
   const [error, setError] = useState("");
   const [touchscreens, setTouchscreens] = useState<TouchscreenDevice[]>([]);
@@ -158,6 +160,7 @@ export default function DisplayLayout() {
               className="flex items-center justify-between rounded-lg bg-muted/40 px-3 py-2.5"
             >
               <div className="flex items-center gap-3">
+                <span className="font-mono text-[13px] font-semibold">{gnomeNumbers.get(d.connector)}</span>
                 <span className="font-mono text-[13px] font-medium">{d.connector}</span>
                 {d.primary && (
                   <span className="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-primary">
@@ -202,7 +205,9 @@ export default function DisplayLayout() {
         <div className="space-y-4">
           {layout.displays.map((d, i) => (
             <div key={d.connector} className="flex items-center justify-between gap-4">
-              <Label className="font-mono text-[13px]">{d.connector}</Label>
+              <Label className="font-mono text-[13px]">
+                {gnomeNumbers.get(d.connector)} {d.connector}
+              </Label>
               <div className="flex items-center gap-3">
                 <Select
                   value={String(d.scale)}
