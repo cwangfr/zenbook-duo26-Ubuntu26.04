@@ -23,6 +23,11 @@ fn mode_id(width: u32, height: u32, refresh_rate: f64) -> String {
     format!("{width}x{height}@{}", format_refresh_rate(refresh_rate))
 }
 
+/// Mutter's DisplayConfig mode id keeps three decimal places. gdctl matches it exactly.
+fn gnome_mode_name(mode: &DisplayMode) -> String {
+    format!("{}x{}@{:.3}", mode.width, mode.height, mode.refresh_rate)
+}
+
 fn make_display_mode(width: u32, height: u32, refresh_rate: f64) -> DisplayMode {
     DisplayMode {
         mode_id: mode_id(width, height, refresh_rate),
@@ -420,75 +425,7 @@ pub fn apply_display_layout(layout: &DisplayLayout) -> Result<(), String> {
 }
 
 fn apply_gnome_display_layout(layout: &DisplayLayout) -> Result<(), String> {
-    if layout.displays.is_empty() {
-        return Err("No displays in layout".into());
-    }
-
-    // gdctl rejects negative logical monitor positions.
-    // Normalize the layout so the smallest x/y becomes 0.
-    let mut min_x: i32 = 0;
-    let mut min_y: i32 = 0;
-    for d in &layout.displays {
-        min_x = min_x.min(d.x);
-        min_y = min_y.min(d.y);
-    }
-    let shift_x = if min_x < 0 { -min_x } else { 0 };
-    let shift_y = if min_y < 0 { -min_y } else { 0 };
-
-    fn transform_arg(t: u32) -> Option<&'static str> {
-        match t {
-            0 => Some("normal"),
-            90 => Some("90"),
-            180 => Some("180"),
-            270 => Some("270"),
-            _ => None,
-        }
-    }
-
-    // Build gdctl set command in logical-monitor mode.
-    // Keep the transform semantics aligned with `gdctl set --help`.
-    let mut args: Vec<String> = vec!["set".into(), "--layout-mode".into(), "logical".into()];
-    let mut primary_used = false;
-
-    for display in &layout.displays {
-        if display.refresh_policy == RefreshPolicy::Dynamic {
-            return Err(format!(
-                "Dynamic refresh is not supported for {} on GNOME",
-                display.connector
-            ));
-        }
-
-        args.push("--logical-monitor".into());
-
-        if display.primary && !primary_used {
-            args.push("--primary".into());
-            primary_used = true;
-        }
-        args.push("--scale".into());
-        args.push(format!("{:.6}", display.scale.max(0.1)));
-        args.push("--monitor".into());
-        args.push(display.connector.clone());
-        args.push("--mode".into());
-        args.push(display.current_mode.mode_id.clone());
-        args.push("--x".into());
-        args.push((display.x + shift_x).to_string());
-        args.push("--y".into());
-        args.push((display.y + shift_y).to_string());
-        if let Some(t) = transform_arg(display.transform) {
-            if t != "normal" {
-                args.push("--transform".into());
-                args.push(t.into());
-            }
-        }
-    }
-
-    // If caller didn't set a primary at all, make the first display primary.
-    if !primary_used {
-        if let Some(pos) = args.iter().position(|a| a == "--logical-monitor") {
-            args.insert(pos + 1, "--primary".into());
-        }
-    }
-
+    let args = build_gnome_display_layout_args(layout)?;
     let output = run_command_output_with_timeout("gdctl", &args, DISPLAY_COMMAND_TIMEOUT_SECS)
         .map_err(|e| format!("Failed to run gdctl: {e}"))?;
 
@@ -903,6 +840,79 @@ fn run_niri_position_command(connector: &str, x: i32, y: i32) -> Result<(), Stri
             "msg", "output", connector, "position", "set", "--", &x_arg, &y_arg,
         ],
     )
+}
+
+fn build_gnome_display_layout_args(layout: &DisplayLayout) -> Result<Vec<String>, String> {
+    if layout.displays.is_empty() {
+        return Err("No displays in layout".into());
+    }
+
+    // gdctl rejects negative logical monitor positions.
+    // Normalize the layout so the smallest x/y becomes 0.
+    let mut min_x: i32 = 0;
+    let mut min_y: i32 = 0;
+    for d in &layout.displays {
+        min_x = min_x.min(d.x);
+        min_y = min_y.min(d.y);
+    }
+    let shift_x = if min_x < 0 { -min_x } else { 0 };
+    let shift_y = if min_y < 0 { -min_y } else { 0 };
+
+    fn transform_arg(t: u32) -> Option<&'static str> {
+        match t {
+            0 => Some("normal"),
+            90 => Some("90"),
+            180 => Some("180"),
+            270 => Some("270"),
+            _ => None,
+        }
+    }
+
+    // Build gdctl set command in logical-monitor mode.
+    // Keep the transform semantics aligned with `gdctl set --help`.
+    let mut args: Vec<String> = vec!["set".into(), "--layout-mode".into(), "logical".into()];
+    let mut primary_used = false;
+
+    for display in &layout.displays {
+        if display.refresh_policy == RefreshPolicy::Dynamic {
+            return Err(format!(
+                "Dynamic refresh is not supported for {} on GNOME",
+                display.connector
+            ));
+        }
+
+        args.push("--logical-monitor".into());
+
+        if display.primary && !primary_used {
+            args.push("--primary".into());
+            primary_used = true;
+        }
+        args.push("--scale".into());
+        args.push(format!("{:.6}", display.scale.max(0.1)));
+        args.push("--monitor".into());
+        args.push(display.connector.clone());
+        args.push("--mode".into());
+        args.push(gnome_mode_name(&display.current_mode));
+        args.push("--x".into());
+        args.push((display.x + shift_x).to_string());
+        args.push("--y".into());
+        args.push((display.y + shift_y).to_string());
+        if let Some(t) = transform_arg(display.transform) {
+            if t != "normal" {
+                args.push("--transform".into());
+                args.push(t.into());
+            }
+        }
+    }
+
+    // If caller didn't set a primary at all, make the first display primary.
+    if !primary_used {
+        if let Some(pos) = args.iter().position(|a| a == "--logical-monitor") {
+            args.insert(pos + 1, "--primary".into());
+        }
+    }
+
+    Ok(args)
 }
 
 fn gnome_scale() -> Result<f64, String> {
@@ -1339,6 +1349,35 @@ Logical monitors:
         let mode = resolve_niri_current_mode(&value).expect("mode should resolve");
         assert_eq!(mode.get("width").and_then(|v| v.as_u64()), Some(2880));
         assert_eq!(mode.get("height").and_then(|v| v.as_u64()), Some(1800));
+    }
+
+    #[test]
+    fn gnome_layout_mode_keeps_mutter_three_decimal_name() {
+        let mode = make_display_mode(2880, 1800, 144.0);
+        assert_eq!(mode.mode_id, "2880x1800@144");
+        let display = DisplayInfo {
+            connector: "eDP-1".into(),
+            width: 2880,
+            height: 1800,
+            refresh_rate: 144.0,
+            scale: 1.666667,
+            x: 0,
+            y: 0,
+            transform: 180,
+            primary: true,
+            enabled: true,
+            current_mode: mode.clone(),
+            available_modes: vec![mode],
+            refresh_policy: RefreshPolicy::Fixed,
+            supports_dynamic_refresh: false,
+        };
+        let args = build_gnome_display_layout_args(&DisplayLayout {
+            displays: vec![display],
+        })
+        .expect("layout args");
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--mode", "2880x1800@144.000"]));
     }
 
     #[test]
