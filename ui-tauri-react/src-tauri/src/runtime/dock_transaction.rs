@@ -169,6 +169,7 @@ async fn publish_dock_target(
         .ok_or("Dock target generation exhausted")?;
     let generation = g.display_safety.next_target_generation;
     g.status.keyboard_attached = attached;
+    g.display_safety.closed_lid_retry_not_before = None;
     g.display_safety.target = Some(DockTarget {
         attached,
         scale,
@@ -180,6 +181,13 @@ async fn publish_dock_target(
     Ok(generation)
 }
 fn start_dock_worker(state: &Arc<RwLock<RuntimeState>>, g: &mut RuntimeState) {
+    if g
+        .display_safety
+        .closed_lid_retry_not_before
+        .is_some_and(|at| std::time::Instant::now() < at)
+    {
+        return;
+    }
     if !g.display_safety.worker_running
         && g.display_safety.target.is_some()
         && g.display_safety.pending.is_none()
@@ -207,7 +215,6 @@ pub(crate) async fn resume_dock_target(state: &Arc<RwLock<RuntimeState>>) {
 pub async fn drain_dock_targets(state: Arc<RwLock<RuntimeState>>) -> Result<(), String> {
     let executor = state.read().await.display_executor.clone();
     let _execution = executor.lock().await;
-    let mut closed_panel_retries = 0;
     loop {
         let target = state.read().await.display_safety.target.clone();
         let Some(target) = target else {
@@ -215,33 +222,36 @@ pub async fn drain_dock_targets(state: Arc<RwLock<RuntimeState>>) -> Result<(), 
             return Ok(());
         };
         let result = drain_one(&state, &target).await;
-        if result
-            .as_ref()
-            .is_err_and(|reason| closed_laptop_panel_refusal(reason))
-            && closed_panel_retries < 4
-            && state
-                .read()
-                .await
-                .display_safety
-                .resume_grace_until
-                .is_some_and(|deadline| std::time::Instant::now() < deadline)
-        {
-            closed_panel_retries += 1;
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
-        }
         let mut g = state.write().await;
         if result
             .as_ref()
             .is_err_and(|reason| closed_laptop_panel_refusal(reason))
             && g.display_safety.degraded.is_none()
         {
-            if g.display_safety
+            let same_generation = g
+                .display_safety
                 .target
                 .as_ref()
-                .is_some_and(|current| current.generation == target.generation)
-            {
+                .is_some_and(|current| current.generation == target.generation);
+            if same_generation {
+                let now = std::time::Instant::now();
+                let hold_for = g.display_safety.resume_grace_until.and_then(|deadline| {
+                    if now < deadline {
+                        Some(Duration::from_secs(1))
+                    } else if now < deadline + Duration::from_secs(45) {
+                        // ponytail: 45s tail after the 15s resume grace; raise the constant if a closed-lid sensor stays shut longer, do not retry without a deadline.
+                        Some(Duration::from_secs(5))
+                    } else {
+                        None
+                    }
+                });
+                if let Some(delay) = hold_for {
+                    g.display_safety.closed_lid_retry_not_before = Some(now + delay);
+                    g.display_safety.worker_running = false;
+                    return Ok(());
+                }
                 g.display_safety.target = None;
+                g.display_safety.closed_lid_retry_not_before = None;
                 let _ = save(&mut g);
             }
             g.display_safety.worker_running = false;
@@ -426,6 +436,7 @@ async fn finish_receipt(
                 if decision == CommitDecision::EvidenceAndTargetComplete {
                     completed_current = true;
                     g.display_safety.target = None;
+                    g.display_safety.closed_lid_retry_not_before = None;
                 }
             } else {
                 g.record_successful_dock_mode(false, false);
@@ -848,8 +859,10 @@ mod tests {
                                 operation.scope.clone(),
                                 Some(operation.clone()),
                                 move || async move {
-                                    if r.join("refuse-closed-laptop").exists() {
-                                        std::fs::remove_file(r.join("refuse-closed-laptop")).unwrap();
+                                    if r.join("refuse-closed-laptop-sticky").exists()
+                                        || r.join("refuse-closed-laptop").exists()
+                                    {
+                                        let _ = std::fs::remove_file(r.join("refuse-closed-laptop"));
                                         return MutationReport {
                                             before: PanelObservation::Disabled,
                                             after: PanelObservation::Disabled,
@@ -1653,6 +1666,16 @@ mod tests {
             .await
             .unwrap();
         idle(&f).await;
+        {
+            let g = f.state.read().await;
+            assert!(g.display_safety.degraded.is_none());
+            assert!(g.display_safety.target.is_some());
+            assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        }
+        f.state.write().await.display_safety.closed_lid_retry_not_before =
+            Some(std::time::Instant::now() - Duration::from_secs(1));
+        resume_dock_target(&f.state).await;
+        idle(&f).await;
         let g = f.state.read().await;
         assert!(g.display_safety.degraded.is_none());
         assert!(g.display_safety.manual_allowed);
@@ -1661,6 +1684,82 @@ mod tests {
         drop(g);
         assert!(f.gate.snapshot().blocked.is_none());
         assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn closed_lid_refusal_keeps_target_for_five_attempts_inside_grace() {
+        let f = fixture("enabled", None).await;
+        super::super::daemon::advance_display_epoch(&f.state, LifecyclePhase::Post)
+            .await
+            .unwrap();
+        std::fs::write(f.root.join("refuse-closed-laptop-sticky"), "").unwrap();
+        submit_dock_target(&f.state, true, 1.67, DockSource::Resume)
+            .await
+            .unwrap();
+        idle(&f).await;
+        for _ in 1..5 {
+            f.state.write().await.display_safety.closed_lid_retry_not_before =
+                Some(std::time::Instant::now() - Duration::from_secs(1));
+            resume_dock_target(&f.state).await;
+            idle(&f).await;
+        }
+        let g = f.state.read().await;
+        assert_eq!(f.calls.load(Ordering::SeqCst), 5);
+        assert!(g.display_safety.target.is_some());
+        assert!(g.display_safety.degraded.is_none());
+        assert!(g.display_safety.manual_allowed);
+        drop(g);
+        assert!(f.gate.snapshot().blocked.is_none());
+    }
+    #[tokio::test]
+    async fn closed_lid_refusal_after_grace_tail_drops_target_without_degrading() {
+        let f = fixture("enabled", None).await;
+        super::super::daemon::reset_resume_grace_for_test().await;
+        f.state.write().await.display_safety.resume_grace_until =
+            Some(std::time::Instant::now() - Duration::from_secs(46));
+        std::fs::write(f.root.join("refuse-closed-laptop-sticky"), "").unwrap();
+        submit_dock_target(&f.state, true, 1.67, DockSource::Resume)
+            .await
+            .unwrap();
+        idle(&f).await;
+        let g = f.state.read().await;
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        assert!(g.display_safety.target.is_none());
+        assert!(g.display_safety.degraded.is_none());
+        assert!(g.display_safety.manual_allowed);
+    }
+    #[tokio::test]
+    async fn closed_lid_refusal_in_tail_retries_then_verifies() {
+        let f = fixture("enabled", None).await;
+        super::super::daemon::reset_resume_grace_for_test().await;
+        f.state.write().await.display_safety.resume_grace_until =
+            Some(std::time::Instant::now() - Duration::from_secs(1));
+        std::fs::write(f.root.join("refuse-closed-laptop"), "").unwrap();
+        submit_dock_target(&f.state, true, 1.67, DockSource::Resume)
+            .await
+            .unwrap();
+        idle(&f).await;
+        {
+            let g = f.state.read().await;
+            assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+            assert!(g.display_safety.target.is_some());
+            assert!(g.display_safety.degraded.is_none());
+            let hold = g
+                .display_safety
+                .closed_lid_retry_not_before
+                .expect("tail holds the target");
+            assert!(hold.duration_since(std::time::Instant::now()) >= Duration::from_secs(4));
+        }
+        f.state.write().await.display_safety.closed_lid_retry_not_before =
+            Some(std::time::Instant::now() - Duration::from_secs(1));
+        resume_dock_target(&f.state).await;
+        idle(&f).await;
+        let g = f.state.read().await;
+        assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+        assert!(g.display_safety.target.is_none());
+        assert!(g.secondary_panel_disabled_by_runtime);
+        assert!(g.display_safety.degraded.is_none());
+        drop(g);
+        assert!(f.gate.snapshot().blocked.is_none());
     }
     #[tokio::test]
     async fn layout_probe_inflight_across_suspend_does_not_disconnect() {

@@ -111,6 +111,8 @@ pub struct DisplaySafetyState {
     pub worker_running: bool,
     #[serde(skip)]
     pub resume_grace_until: Option<std::time::Instant>,
+    #[serde(skip)]
+    pub closed_lid_retry_not_before: Option<std::time::Instant>,
 }
 impl Default for DisplaySafetyState {
     fn default() -> Self {
@@ -130,6 +132,7 @@ impl Default for DisplaySafetyState {
             last_seen_revision: None,
             worker_running: false,
             resume_grace_until: None,
+            closed_lid_retry_not_before: None,
         }
     }
 }
