@@ -200,10 +200,10 @@ pub(crate) async fn run_manual(mutation: ManualDisplayMutation, sensor: bool) ->
             ManualDisplayMutation::Orientation { orientation, .. } => {
                 let verified = after_layout.as_ref().is_ok_and(|actual| {
                     let transform = match orientation {
-                        crate::models::Orientation::Normal => 180,
-                        crate::models::Orientation::Left => 90,
-                        crate::models::Orientation::Right => 270,
-                        crate::models::Orientation::Inverted => 0,
+                        crate::models::Orientation::Normal => 0,
+                        crate::models::Orientation::Left => 270,
+                        crate::models::Orientation::Right => 90,
+                        crate::models::Orientation::Inverted => 180,
                     };
                     actual.displays.iter().any(|display| {
                         display.connector == "eDP-1"

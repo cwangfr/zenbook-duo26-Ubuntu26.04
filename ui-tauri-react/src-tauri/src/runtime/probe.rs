@@ -85,9 +85,8 @@ fn monitor_count(layout: Option<&crate::models::DisplayLayout>, current: u32) ->
 fn inferred_orientation(layout: Option<&crate::models::DisplayLayout>) -> Option<Orientation> {
     let layout = layout?;
 
-    // In a real dual-screen GNOME layout eDP-2 is the stable transform source.
-    // eDP-1 can be reported as `normal` while mutter rebuilds the paired layout,
-    // which previously made every orientation look inverted.
+    // Prefer eDP-2 when it is enabled. A layout rebuild can publish eDP-1
+    // before the paired panel's transform is ready.
     if let Some(secondary) = layout
         .displays
         .iter()

@@ -953,26 +953,27 @@ fn set_gnome_orientation(orientation: &Orientation, scale: Option<f64>) -> Resul
 }
 
 fn gnome_orientation_transforms(orientation: &Orientation) -> (&'static str, &'static str) {
-    // Duo baseline for GNOME:
-    // normal => eDP-1 flipped(180), eDP-2 normal
+    // eDP-1 is mounted upside down. The kernel advertises that with
+    // video=eDP-1:panel_orientation=upside_down, and Mutter adds it when
+    // programming the CRTC. These are the logical transforms: Normal stays
+    // "normal" and the scanout is still 180.
     // GNOME's numeric viewport transforms are opposite to the UI's left/right
     // labels, just as KDE's rotation tokens are.
     match orientation {
-        Orientation::Normal => ("180", "normal"),
-        Orientation::Left => ("90", "270"),
-        Orientation::Right => ("270", "90"),
-        Orientation::Inverted => ("normal", "180"),
+        Orientation::Normal => ("normal", "normal"),
+        Orientation::Left => ("270", "270"),
+        Orientation::Right => ("90", "90"),
+        Orientation::Inverted => ("180", "180"),
     }
 }
 
-/// Translate the main panel's persisted GNOME transform into the orientation
-/// exposed by the app. eDP-1 is mounted upside down, so its normal baseline is
-/// `180` rather than `normal`.
+/// Translate eDP-1's logical GNOME transform into the app orientation.
+/// The panel mount is corrected by the kernel, so an upright image is `0`.
 pub fn zenbook_duo_primary_orientation(transform: u32) -> Orientation {
     match transform % 360 {
-        180 => Orientation::Normal,
-        90 => Orientation::Left,
-        270 => Orientation::Right,
+        0 => Orientation::Normal,
+        270 => Orientation::Left,
+        90 => Orientation::Right,
         _ => Orientation::Inverted,
     }
 }
@@ -1417,7 +1418,7 @@ Logical monitors:
     fn gnome_orientation_uses_flipped_secondary_baseline() {
         let args = build_gnome_orientation_args(&Orientation::Normal, 1.66, 2);
         let joined = args.join(" ");
-        assert!(joined.contains("--monitor eDP-1 --transform 180"));
+        assert!(joined.contains("--monitor eDP-1 --transform normal"));
         assert!(joined.contains("--monitor eDP-2 --below eDP-1 --transform normal"));
         assert!(joined.contains("--below eDP-1"));
     }
@@ -1427,15 +1428,15 @@ Logical monitors:
         let args = build_gnome_orientation_args(&Orientation::Left, 1.66, 2);
         let joined = args.join(" ");
         assert!(joined.contains("--right-of eDP-1"));
-        assert!(joined.contains("--monitor eDP-1 --transform 90"));
+        assert!(joined.contains("--monitor eDP-1 --transform 270"));
         assert!(joined.contains("--monitor eDP-2 --right-of eDP-1 --transform 270"));
     }
 
     #[test]
     fn decodes_the_main_panel_transform_from_its_upside_down_baseline() {
-        assert_eq!(zenbook_duo_primary_orientation(180), Orientation::Normal);
-        assert_eq!(zenbook_duo_primary_orientation(90), Orientation::Left);
-        assert_eq!(zenbook_duo_primary_orientation(270), Orientation::Right);
-        assert_eq!(zenbook_duo_primary_orientation(0), Orientation::Inverted);
+        assert_eq!(zenbook_duo_primary_orientation(0), Orientation::Normal);
+        assert_eq!(zenbook_duo_primary_orientation(270), Orientation::Left);
+        assert_eq!(zenbook_duo_primary_orientation(90), Orientation::Right);
+        assert_eq!(zenbook_duo_primary_orientation(180), Orientation::Inverted);
     }
 }

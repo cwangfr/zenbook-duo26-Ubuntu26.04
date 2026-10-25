@@ -531,7 +531,7 @@ fn build_gnome_dock_mode_args(attached: bool, scale: f64) -> Vec<String> {
             "--monitor".to_string(),
             "eDP-1".to_string(),
             "--transform".to_string(),
-            "180".to_string(),
+            "normal".to_string(),
         ]
     } else {
         vec![
@@ -543,7 +543,7 @@ fn build_gnome_dock_mode_args(attached: bool, scale: f64) -> Vec<String> {
             "--monitor".to_string(),
             "eDP-1".to_string(),
             "--transform".to_string(),
-            "180".to_string(),
+            "normal".to_string(),
             "--logical-monitor".to_string(),
             "--scale".to_string(),
             scale_str,
@@ -569,7 +569,7 @@ fn build_gnome_attached_fallback_args(scale: f64) -> Vec<String> {
         "--monitor".to_string(),
         "eDP-1".to_string(),
         "--transform".to_string(),
-        "180".to_string(),
+        "normal".to_string(),
     ]
 }
 
@@ -1470,7 +1470,7 @@ mod tests {
     fn gnome_dock_mode_detached_sets_flipped_secondary_transform() {
         let args = build_gnome_dock_mode_args(false, 1.66);
         let joined = args.join(" ");
-        assert!(joined.contains("--monitor eDP-1 --transform 180"));
+        assert!(joined.contains("--monitor eDP-1 --transform normal"));
         assert!(joined.contains("--monitor eDP-2 --below eDP-1 --transform normal"));
         assert!(joined.contains("--below eDP-1"));
     }
@@ -1479,7 +1479,7 @@ mod tests {
     fn gnome_dock_mode_attached_omits_secondary_from_configuration() {
         let args = build_gnome_dock_mode_args(true, 1.66);
         let joined = args.join(" ");
-        assert!(joined.contains("--monitor eDP-1 --transform 180"));
+        assert!(joined.contains("--monitor eDP-1 --transform normal"));
         assert!(!joined.contains("eDP-2"));
         assert!(!joined.contains("--mode off"));
     }
@@ -1488,7 +1488,7 @@ mod tests {
     fn gnome_attached_fallback_targets_primary_panel_only() {
         let args = build_gnome_attached_fallback_args(1.66);
         let joined = args.join(" ");
-        assert!(joined.contains("--monitor eDP-1 --transform 180"));
+        assert!(joined.contains("--monitor eDP-1 --transform normal"));
         assert!(!joined.contains("eDP-2"));
     }
 
