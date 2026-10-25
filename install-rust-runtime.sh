@@ -170,6 +170,7 @@ Description=Zenbook Duo Session Agent
 ConditionUser=!gdm
 Wants=graphical-session.target
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
